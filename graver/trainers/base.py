@@ -36,6 +36,7 @@ class Trainer:
         models,
         dataset,
         *,
+        test_dataset=None,
         output_dir,
         load_dir,
         step,
@@ -65,6 +66,7 @@ class Trainer:
 
         self.models = models
         self.dataset = dataset
+        self.test_dataset = test_dataset
         self.batch_split = batch_split if batch_split is not None else 1
         self.max_steps = max_steps
         self.optimizer_config = optimizer

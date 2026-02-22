@@ -40,8 +40,8 @@ class BlockFeats(StandardDatasetBase):
             self.metadata = self.metadata.iloc[:self.max_samples]
 
         self.loads = [
-            max(1, int(self.metadata.loc[sha256, f'{COL_PREFIX}_num_blocks']))
-            for _, sha256 in self.instances
+            max(1, int(self.metadata.at[i, f'{COL_PREFIX}_num_blocks']))
+            for i in range(len(self.instances))
         ]
         if self.max_samples > 0:
             print(f'  [Dataset] max_samples={self.max_samples}, actual={len(self.instances)}')
@@ -133,6 +133,51 @@ class BlockFeats(StandardDatasetBase):
         return v, faces
 
     @staticmethod
+    def _gpu_bilateral_smooth(vertices, faces, iterations=2, lam=0.4, sigma_n=0.3):
+        """
+        GPU Bilateral Mesh Smoothing — 在去噪的同时保留锐利边缘.
+        
+        原理: 在 Laplacian 位移上乘以法线相似性权重.
+        法线相似 → 大权重 → 正常平滑 (去噪)
+        法线不同 → 小权重 → 几乎不动 (保边)
+        
+        sigma_n: 法线差异敏感度. 越小越保边 (推荐 0.2~0.5)
+        """
+        v = vertices.clone()
+        f = faces.long()
+
+        # 构建边连接 (一次性)
+        e01 = torch.stack([f[:, 0], f[:, 1]], dim=1)
+        e12 = torch.stack([f[:, 1], f[:, 2]], dim=1)
+        e20 = torch.stack([f[:, 2], f[:, 0]], dim=1)
+        edges = torch.cat([e01, e12, e20, e01.flip(1), e12.flip(1), e20.flip(1)], dim=0)
+        src, dst = edges[:, 0], edges[:, 1]
+
+        for _ in range(iterations):
+            # 计算顶点法线 (面积加权)
+            v0, v1, v2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+            fn = torch.cross(v1 - v0, v2 - v0, dim=1)
+            vn = torch.zeros_like(v)
+            for i in range(3):
+                vn.scatter_add_(0, f[:, i].unsqueeze(1).expand(-1, 3), fn)
+            vn = vn / (vn.norm(dim=1, keepdim=True) + 1e-8)
+
+            # 法线相似性 bilateral weight
+            n_dot = (vn[src] * vn[dst]).sum(dim=1)           # cos similarity [-1, 1]
+            w = torch.exp((n_dot - 1.0) / (sigma_n ** 2))    # 法线越近 w→1, 差别大 w→0
+
+            # 加权 Laplacian
+            weighted_sum = torch.zeros_like(v)
+            weight_total = torch.zeros(v.shape[0], 1, device=v.device)
+            weighted_sum.scatter_add_(0, dst.unsqueeze(1).expand(-1, 3), v[src] * w.unsqueeze(1))
+            weight_total.scatter_add_(0, dst.unsqueeze(1), w.unsqueeze(1))
+            weight_total = weight_total.clamp(min=1e-8)
+
+            v = v + lam * (weighted_sum / weight_total - v)
+
+        return v, faces
+
+    @staticmethod
     def tokens_to_mesh(coords_np, tokens_np, output_path, verbose=True):
         """
         将 block tokens 重建为 mesh 并保存 — 全 GPU 流水线.
@@ -208,8 +253,20 @@ class BlockFeats(StandardDatasetBase):
         all_global = coords[:, None, :] * BLOCK_INNER + local_vox[None, :, :]
 
         mc_thr = 1.0 * MC_THRESHOLD
+
+        # ---- UDF Sharpening: 加陡表面处梯度 → MC 提取更锐利 ----
+        # power > 1 把靠近 0 的值压得更低, 靠近 mc_thr 的值不变
+        # 效果: 表面处零交叉变陡 → 三角面更贴合真实表面
+        SHARPEN_ALPHA = 1.5
+        normalized = (all_logits / mc_thr).clamp(min=0)
+        all_logits = mc_thr * torch.where(
+            normalized <= 1.0,
+            normalized.pow(SHARPEN_ALPHA),
+            1.0 + (normalized - 1.0) * SHARPEN_ALPHA,
+        )
+
         valid = (torch.isfinite(all_logits).all(dim=-1)
-                 & (all_logits.min(dim=-1).values < (mc_thr + 0.005)))
+                 & (all_logits.min(dim=-1).values < (mc_thr + 0.03)))
 
         valid_coords = all_global[valid].long()
         valid_logits = all_logits[valid].float()
@@ -255,8 +312,8 @@ class BlockFeats(StandardDatasetBase):
 
         new_v, new_f = cm.read()
 
-        # ---- GPU Laplacian smoothing ----
-        new_v, new_f = BlockFeats._gpu_laplacian_smooth(new_v, new_f, iterations=1, lam=0.5)
+        # ---- GPU Bilateral smoothing (保边去噪) ----
+        new_v, new_f = BlockFeats._gpu_bilateral_smooth(new_v, new_f, iterations=3, lam=0.4, sigma_n=0.3)
 
         # ---- 导出 (唯一 CPU 步骤: I/O) ----
         mesh_out = trimesh.Trimesh(

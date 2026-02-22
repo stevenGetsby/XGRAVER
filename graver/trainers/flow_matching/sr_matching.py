@@ -27,6 +27,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         *args,
         lambda_flow: float = 1.0,
         lambda_normal: float = 0.1,
+        lambda_sharpness: float = 0.05,
         surface_weight: float = 10.0,
         loss_type: str = "v_loss",
         complexity_boost: float = 4.0,
@@ -37,6 +38,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         super().__init__(*args, **kwargs)
         self.lambda_flow = lambda_flow
         self.lambda_normal = lambda_normal
+        self.lambda_sharpness = lambda_sharpness
         self.surface_weight = surface_weight
         self.complexity_boost = complexity_boost
         self.cond_noise_std = cond_noise_std
@@ -46,6 +48,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
         print(f"[MultiTokenTrainer] loss_type={self.loss_type}, "
               f"λ_flow={lambda_flow}, λ_normal={lambda_normal}, "
+              f"λ_sharpness={lambda_sharpness}, "
               f"surface_weight={surface_weight}, "
               f"complexity_boost={complexity_boost}, "
               f"noise_scale={noise_scale}")
@@ -158,9 +161,48 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
         # 2. Eikonal Loss (UDF 梯度模长必须为 1)
         eikonal_loss = (pred_norm - 1.0).abs() * w_3d
-        loss = dir_loss + 0.5 * eikonal_loss
+
+        # 3. Edge-aware weighting: 高曲率区域(法线变化大)加权更高
+        with torch.no_grad():
+            gt_laplacian = self._grad_3d(gt_norm)  # 梯度模长的梯度 → 曲率代理
+            curvature = gt_laplacian.norm(dim=1, keepdim=True)
+            edge_w = 1.0 + 2.0 * (curvature / curvature.max().clamp(min=1e-6))  # [1, 3]
+
+        loss = (dir_loss + 0.5 * eikonal_loss) * edge_w
 
         return loss.mean()
+
+    def _sharpness_loss(self, pred_feats: torch.Tensor, gt_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Gradient Sharpness Loss: 鼓励模型在表面附近产生陡峭的 UDF 梯度.
+        陡峭梯度 → Marching Cubes 提取出的表面更锐利.
+        """
+        D = BLOCK_DIM
+        T = pred_feats.shape[0]
+        v = self.voxel
+
+        with torch.no_grad():
+            # 表面附近 block: 含有 UDF < 1.5v 的体素
+            surface_mask = (gt_feats < v * 1.5).any(dim=1)
+        T_s = surface_mask.sum().item()
+        if T_s == 0:
+            return torch.tensor(0.0, device=pred_feats.device)
+
+        pred_vol = pred_feats[surface_mask].reshape(T_s, 1, D, D, D)
+        pred_grad = self._grad_3d(pred_vol)                     # [T_s, 3, D, D, D]
+        pred_norm = pred_grad.norm(dim=1, keepdim=True)         # [T_s, 1, D, D, D]
+
+        with torch.no_grad():
+            gt_vol = gt_feats[surface_mask].reshape(T_s, 1, D, D, D)
+            gt_grad_norm = self._grad_3d(gt_vol).norm(dim=1, keepdim=True)
+
+            # 只在 MC 插值带内计算 (UDF < v * 1.5)
+            w = (gt_feats[surface_mask] < v * 1.5).float().reshape(T_s, 1, D, D, D)
+
+        # 鼓励 pred 梯度模长至少达到 GT 梯度模长
+        # max(0, gt_norm - pred_norm) → 惩罚梯度不够陡的地方
+        shortfall = F.relu(gt_grad_norm - pred_norm) * w
+        return shortfall.mean()
 
     # ------------------------------------------------------------------
     # Training losses
@@ -267,6 +309,11 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         if self.lambda_normal > 0:
             terms["normal_loss"] = self._normal_loss(pred.feats, x.feats)
             terms["loss"] = terms["loss"] + self.lambda_normal * terms["normal_loss"]
+
+        # Gradient Sharpness Loss
+        if self.lambda_sharpness > 0:
+            terms["sharpness_loss"] = self._sharpness_loss(pred.feats, x.feats)
+            terms["loss"] = terms["loss"] + self.lambda_sharpness * terms["sharpness_loss"]
 
         if _profile:
             torch.cuda.synchronize()
@@ -381,7 +428,15 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             m.eval()
 
         try:
-            snap_dataset = copy.deepcopy(self.dataset)
+            # 优先使用 test_dataset (固定测试集), 否则 fallback 到训练集
+            if hasattr(self, 'test_dataset') and self.test_dataset is not None:
+                snap_dataset = self.test_dataset
+                if verbose:
+                    print(f"  Using test_dataset ({len(snap_dataset)} samples)")
+            else:
+                snap_dataset = copy.deepcopy(self.dataset)
+                if verbose:
+                    print(f"  Using train dataset (deepcopy, {len(snap_dataset)} samples)")
             dataloader = DataLoader(
                 snap_dataset,
                 batch_size=batch_size,

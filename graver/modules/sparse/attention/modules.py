@@ -130,17 +130,13 @@ class SparseMultiHeadAttention(nn.Module):
         if self._type == "self":
             qkv = self._linear(self.to_qkv, x)
             qkv = self._fused_pre(qkv, num_fused=3)
-            
-            # 先应用 RoPE，再应用 RMS Norm
             if self.use_rope:
                 qkv = self._rope(qkv)
-            
             if self.qk_rms_norm:
                 q, k, v = qkv.unbind(dim=1)
                 q = self.q_rms_norm(q)
                 k = self.k_rms_norm(k)
                 qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
-            
             if self.attn_mode == "full":
                 h = sparse_scaled_dot_product_attention(qkv)
             elif self.attn_mode == "serialized":
@@ -167,7 +163,7 @@ class SparseMultiHeadAttention(nn.Module):
                     k, v = kv.unbind(dim=2)
                     k = self.k_rms_norm(k)
                     kv = torch.stack([k, v], dim=2)
-            # TopK KV selection: 1369 → topk, 省 ~63% cross-attn FLOPs
+            # TopK KV selection
             if self.cross_attn_topk > 0 and isinstance(kv, torch.Tensor):
                 kv = topk_kv_selection(
                     q, kv, topk=self.cross_attn_topk,

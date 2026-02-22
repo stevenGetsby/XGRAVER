@@ -11,10 +11,9 @@
                 "mlp_ratio": 4,
                 "pe_mode": "rope",
                 "attn_mode": "windowed",
-                "window_size": 16,
+                "window_size": 32,
                 "pool_stride": 4,
-                "num_pooled_layers": 8,
-                "use_ssa": true,
+                "num_pooled_layers": 0,
                 "use_fp16": true,
                 "qk_rms_norm": true,
                 "qk_rms_norm_cross": true,
@@ -27,7 +26,21 @@
     "dataset": {
         "name": "ImageConditionedBlockFeats",
         "args": {
-            "max_block_num": 70000,
+            "roots": [
+                "/mnt/data/yizhao/JiTData_Test"
+            ],
+            "max_block_num": 110000,
+            "min_aesthetic_score": 0.0,
+            "max_samples": 0
+        }
+    },
+    "test_dataset": {
+        "name": "ImageConditionedBlockFeats",
+        "args": {
+            "roots": [
+                "/mnt/data/yizhao/TESTDATA"
+            ],
+            "max_block_num": 110000,
             "min_aesthetic_score": 0.0,
             "max_samples": 0
         }
@@ -39,8 +52,9 @@
             "batch_size_per_gpu": 1,
             "batch_split": 1,
             "loss_type": "v_loss",
-            "lambda_normal": 0.1,
-            "surface_weight": 5.0,
+            "lambda_normal": 0.2,
+            "lambda_sharpness": 0.05,
+            "surface_weight": 8.0,
             "complexity_boost": 4.0,
             "cond_noise_std": 0.0,
             "t_schedule": {
@@ -64,7 +78,7 @@
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
                 "args": {
-                    "max_norm": 1.0,
+                    "max_norm": 4.0,
                     "clip_percentile": 95
                 }
             },

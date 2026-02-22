@@ -1,0 +1,29 @@
+# ================= 忽略特定大文件/日志 =================
+ckpt/
+sparse_train.log
+*.npz
+*.ply
+*.obj
+*.log
+
+# ================= Python 常规忽略 =================
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+*.egg-info/
+.env
+.venv
+env/
+venv/
+
+# ================= 系统/IDE 文件 =================
+.DS_Store
+.vscode/
+.idea/
+
+# ================= 其他可能的中间产物 =================
+tests/temp/
+output/
+*_summary.txt
+log.txt

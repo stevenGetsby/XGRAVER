@@ -197,15 +197,27 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
     elif ATTN == 'flash_attn':
-        cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
+        # Cache cu_seqlens on GPU via spatial_cache to avoid CPU→GPU sync
+        _cu_cache_key = 'full_attn_cu_seqlens'
+        _cu_cached = s.get_spatial_cache(_cu_cache_key) if s is not None else None
+        if _cu_cached is not None:
+            cu_seqlens_q, max_seqlen_q = _cu_cached
+        else:
+            cu_seqlens_q = torch.zeros(len(q_seqlen) + 1, device=device, dtype=torch.int32)
+            cu_seqlens_q[1:] = torch.tensor(q_seqlen, device=device, dtype=torch.int32).cumsum(0)
+            max_seqlen_q = max(q_seqlen)
+            if s is not None:
+                s.register_spatial_cache(_cu_cache_key, (cu_seqlens_q, max_seqlen_q))
         if num_all_args in [2, 3]:
-            cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
+            cu_seqlens_kv = torch.zeros(len(kv_seqlen) + 1, device=device, dtype=torch.int32)
+            cu_seqlens_kv[1:] = torch.tensor(kv_seqlen, device=device, dtype=torch.int32).cumsum(0)
+            max_seqlen_kv = max(kv_seqlen)
         if num_all_args == 1:
-            out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens_q, max(q_seqlen))
+            out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens_q, max_seqlen_q)
         elif num_all_args == 2:
-            out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+            out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
         elif num_all_args == 3:
-            out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+            out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
     else:
         raise ValueError(f"Unknown attention module: {ATTN}")
     

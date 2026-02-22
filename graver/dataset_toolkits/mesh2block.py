@@ -416,4 +416,11 @@ if __name__ == "__main__":
     generate_adaptive_udf(args.input, npz_path, verbose=True, device=args.device)
     reconstruct_mesh(npz_path, ply_path, keep_band=args.keep_band, verbose=True)
 
+    # 渲染法线图
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+    from graver.renderers.normal_render import render_random_normals_grid
+    normal_path = os.path.join(args.output_dir, "normal.jpg")
+    render_random_normals_grid(ply_path, normal_path, resolution=1024, radius=1.75)
+
     print("✅ All done!")

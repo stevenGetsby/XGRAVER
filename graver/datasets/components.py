@@ -14,16 +14,21 @@ class StandardDatasetBase(Dataset):
     Base class for standard datasets.
 
     Args:
-        roots (str): paths to the dataset
+        roots (str or list): paths to the dataset.
+            - str: single path or comma-separated paths
+            - list: list of paths
     """
 
     def __init__(self,
-        roots: str,
+        roots: Union[str, List[str]],
     ):
         super().__init__()
-        self.roots = roots.split(',')
+        if isinstance(roots, list):
+            self.roots = roots
+        else:
+            self.roots = [r.strip() for r in roots.split(',') if r.strip()]
         self.instances = []
-        self.metadata = pd.DataFrame()
+        all_metadata = []
         
         self._stats = {}
         for root in self.roots:
@@ -34,8 +39,10 @@ class StandardDatasetBase(Dataset):
             metadata, stats = self.filter_metadata(metadata)
             self._stats[key].update(stats)
             self.instances.extend([(root, sha256) for sha256 in metadata['sha256'].values])
-            metadata.set_index('sha256', inplace=True)
-            self.metadata = pd.concat([self.metadata, metadata])
+            all_metadata.append(metadata)
+
+        # 整数 index, 与 self.instances 一一对齐 (不去重, 支持不同 root 同 sha256 不同数据)
+        self.metadata = pd.concat(all_metadata, ignore_index=True)
             
     @abstractmethod
     def filter_metadata(self, metadata: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
@@ -72,9 +79,8 @@ class TextConditionedMixin:
     def __init__(self, roots, **kwargs):
         super().__init__(roots, **kwargs)
         self.captions = {}
-        for instance in self.instances:
-            sha256 = instance[1]
-            self.captions[sha256] = json.loads(self.metadata.loc[sha256]['captions'])
+        for i, (root, sha256) in enumerate(self.instances):
+            self.captions[(root, sha256)] = json.loads(self.metadata.at[i, 'captions'])
     
     def filter_metadata(self, metadata):
         metadata, stats = super().filter_metadata(metadata)
@@ -84,7 +90,7 @@ class TextConditionedMixin:
     
     def get_instance(self, root, instance):
         pack = super().get_instance(root, instance)
-        text = np.random.choice(self.captions[instance])
+        text = np.random.choice(self.captions[(root, instance)])
         pack['cond'] = text
         return pack
     

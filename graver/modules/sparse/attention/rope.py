@@ -64,26 +64,25 @@ class SparseRotaryPositionEmbedder(nn.Module):
         use_spatial_coords: bool
     ) -> torch.Tensor:
         """
-        获取或计算 RoPE phases，支持缓存
+        获取或计算 RoPE phases，使用 spatial_cache 持久缓存.
+
+        spatial_cache 在 SparseTensor.replace() 时自动传播 (共享 dict 引用),
+        因此 phases 仅在第一个 block 首次计算, 后续所有 block 直接复用.
+        旧版使用 _cache: 每次 replace() 丢失, 8 个 block 重复计算 8 次.
         """
-        # 尝试从 SparseTensor 的 _cache 获取
-        if hasattr(sparse_tensor, '_cache') and cache_key in sparse_tensor._cache:
-            return sparse_tensor._cache[cache_key]
+        cached = sparse_tensor.get_spatial_cache(cache_key)
+        if cached is not None:
+            return cached
         
         # 计算 phases
         if use_spatial_coords:
-            # 使用真实 3D 空间坐标
-            # coords: [T, 4] -> [T, 3] (去掉 batch_idx)
             coords = sparse_tensor.coords[:, 1:].float()
-            # 展平所有坐标: [T, 3] -> [T*3]
-            phases = self._get_phases(coords.reshape(-1))  # [T*3, freq_dim]
-            # reshape 回去: [T*3, freq_dim] -> [T, 3*freq_dim]
-            phases = phases.reshape(*coords.shape[:-1], -1)  # [T, 3*freq_dim]
+            phases = self._get_phases(coords.reshape(-1))
+            phases = phases.reshape(*coords.shape[:-1], -1)
         else:
-            # 使用序列索引
             T = sparse_tensor.feats.shape[0]
             indices = torch.arange(T, device=sparse_tensor.coords.device, dtype=torch.float32)
-            phases = self._get_phases(indices)  # [T, freq_dim]
+            phases = self._get_phases(indices)
         
         # Padding 到 head_dim // 2
         if phases.shape[-1] < self.head_dim // 2:
@@ -93,9 +92,7 @@ class SparseRotaryPositionEmbedder(nn.Module):
                 torch.zeros(*phases.shape[:-1], padn, device=phases.device)
             )], dim=-1)
         
-        # 缓存到 SparseTensor
-        if not hasattr(sparse_tensor, '_cache'):
-            sparse_tensor._cache = {}
-        sparse_tensor._cache[cache_key] = phases
+        # 缓存到 spatial_cache (通过 replace() 自动传播, 跨 block 复用)
+        sparse_tensor.register_spatial_cache(cache_key, phases)
         
         return phases

@@ -8,7 +8,7 @@ from ..modules.norm import LayerNorm32
 from ..modules.utils import convert_module_to_f16, convert_module_to_f32
 from ..modules.transformer import AbsolutePositionEmbedder
 from ..modules import sparse as sp
-from ..modules.sparse.transformer import ModulatedSparseTransformerCrossBlock, PooledSparseTransformerCrossBlock, SSASparseTransformerCrossBlock
+from ..modules.sparse.transformer import ModulatedSparseTransformerCrossBlock, PooledSparseTransformerCrossBlock
 from ..dataset_toolkits.mesh2block import BLOCK_DIM
 from .dense_flow import TimestepEmbedder
 
@@ -42,7 +42,6 @@ class SparseFlowModel(nn.Module):
         pool_stride: int = 8,
         pool_stride_coarse: int = 0,
         num_pooled_layers: int = 0,
-        use_ssa: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -94,31 +93,10 @@ class SparseFlowModel(nn.Module):
                 torch.randn(1, num_context_registers, cond_channels) * 0.02
             )
 
-        self.use_ssa = use_ssa
         blocks = []
         coarse_stride = pool_stride_coarse if pool_stride_coarse > 0 else pool_stride * 2
         for i in range(num_blocks):
-            if i < num_pooled_layers and use_ssa:
-                # SSA Block: self-attn Q 全分辨率 + KV 池化 (全局 & per-token)
-                half_pooled = num_pooled_layers // 2
-                stride_i = coarse_stride if i < half_pooled else pool_stride
-                blocks.append(SSASparseTransformerCrossBlock(
-                    model_channels,
-                    cond_channels,
-                    num_heads=self.num_heads,
-                    mlp_ratio=mlp_ratio,
-                    use_checkpoint=use_checkpoint,
-                    use_rope=(pe_mode == "rope"),
-                    share_mod=share_mod,
-                    qk_rms_norm=qk_rms_norm,
-                    qk_rms_norm_cross=qk_rms_norm_cross,
-                    cross_attn_topk=cross_attn_topk,
-                    use_moe=(num_blocks - i <= num_moe_layers),
-                    num_experts=num_experts,
-                    moe_top_k=moe_top_k,
-                    pool_stride=stride_i,
-                ))
-            elif i < num_pooled_layers:
+            if i < num_pooled_layers:
                 # Pooled Block: 全部计算在池化空间
                 half_pooled = num_pooled_layers // 2
                 stride_i = coarse_stride if i < half_pooled else pool_stride
@@ -139,7 +117,7 @@ class SparseFlowModel(nn.Module):
                     pool_stride=stride_i,
                 ))
             else:
-                # Standard Block: 全分辨率全计算 (最高质量)
+                # Standard Block: windowed self-attn + cross-attn + MLP
                 blocks.append(ModulatedSparseTransformerCrossBlock(
                     model_channels,
                     cond_channels,
@@ -176,8 +154,7 @@ class SparseFlowModel(nn.Module):
               f"attn={attn_mode}, w={window_size}, heads={self.num_heads}, "
               f"fp16={use_fp16}, params={n_params:.1f}M")
         if num_pooled_layers > 0:
-            block_type = "SSA" if use_ssa else "pooled"
-            print(f"  layers: {num_pooled_layers} {block_type} (stride coarse:{coarse_stride}/fine:{pool_stride}) "
+            print(f"  layers: {num_pooled_layers} pooled (stride coarse:{coarse_stride}/fine:{pool_stride}) "
                   f"+ {num_blocks - num_pooled_layers} standard")
         if num_context_registers > 0:
             print(f"  registers={num_context_registers}, start_block={context_start_block}")

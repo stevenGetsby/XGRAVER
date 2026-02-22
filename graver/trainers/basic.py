@@ -422,7 +422,7 @@ class BasicTrainer(Trainer):
 
         # Logs
         step_log['loss'] = dict_reduce(losses, lambda x: np.mean(x))
-        step_log['status'] = dict_reduce(statuses, lambda x: np.mean(x), special_func={'min': lambda x: np.min(x), 'max': lambda x: np.max(x)})
+        step_log['status'] = dict_reduce(statuses, lambda x: np.mean(x) if len(x) > 0 else 0.0, special_func={'min': lambda x: np.min(x) if len(x) > 0 else 0.0, 'max': lambda x: np.max(x) if len(x) > 0 else 0.0})
         if self.elastic_controller_config is not None:
             step_log['elastic'] = dict_reduce(elastic_controller_logs, lambda x: np.mean(x))
         if self.grad_clip is not None:

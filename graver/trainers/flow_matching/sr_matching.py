@@ -27,7 +27,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         *args,
         lambda_flow: float = 1.0,
         lambda_normal: float = 0.1,
-        lambda_sharpness: float = 0.05,
         surface_weight: float = 10.0,
         loss_type: str = "v_loss",
         complexity_boost: float = 4.0,
@@ -38,7 +37,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         super().__init__(*args, **kwargs)
         self.lambda_flow = lambda_flow
         self.lambda_normal = lambda_normal
-        self.lambda_sharpness = lambda_sharpness
         self.surface_weight = surface_weight
         self.complexity_boost = complexity_boost
         self.cond_noise_std = cond_noise_std
@@ -48,7 +46,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
         print(f"[MultiTokenTrainer] loss_type={self.loss_type}, "
               f"λ_flow={lambda_flow}, λ_normal={lambda_normal}, "
-              f"λ_sharpness={lambda_sharpness}, "
               f"surface_weight={surface_weight}, "
               f"complexity_boost={complexity_boost}, "
               f"noise_scale={noise_scale}")
@@ -172,37 +169,92 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
         return loss.mean()
 
-    def _sharpness_loss(self, pred_feats: torch.Tensor, gt_feats: torch.Tensor) -> torch.Tensor:
+    @torch.no_grad()
+    def _neighborhood_complexity(
+        self,
+        gt_feats: torch.Tensor,
+        coords: torch.Tensor,
+        layout: List[slice],
+        voxel: float,
+        boost: float,
+    ) -> torch.Tensor:
         """
-        Gradient Sharpness Loss: 鼓励模型在表面附近产生陡峭的 UDF 梯度.
-        陡峭梯度 → Marching Cubes 提取出的表面更锐利.
+        邻域曲率复杂度: 连通 block 间曲率变化越剧烈 → 权重越大.
+        复杂几何 (耳朵、手指、褶皱) = 多个邻近 block 曲率急变的区域.
         """
         D = BLOCK_DIM
-        T = pred_feats.shape[0]
-        v = self.voxel
+        T = gt_feats.shape[0]
+        device = gt_feats.device
 
-        with torch.no_grad():
-            # 表面附近 block: 含有 UDF < 1.5v 的体素
-            surface_mask = (gt_feats < v * 1.5).any(dim=1)
+        # 1. Per-block curvature: 表面体素内梯度模长的标准差
+        surface_mask = (gt_feats < voxel * 2).any(dim=1)  # [T]
+        block_curvature = torch.zeros(T, device=device)
         T_s = surface_mask.sum().item()
-        if T_s == 0:
-            return torch.tensor(0.0, device=pred_feats.device)
 
-        pred_vol = pred_feats[surface_mask].reshape(T_s, 1, D, D, D)
-        pred_grad = self._grad_3d(pred_vol)                     # [T_s, 3, D, D, D]
-        pred_norm = pred_grad.norm(dim=1, keepdim=True)         # [T_s, 1, D, D, D]
-
-        with torch.no_grad():
+        if T_s > 0:
             gt_vol = gt_feats[surface_mask].reshape(T_s, 1, D, D, D)
-            gt_grad_norm = self._grad_3d(gt_vol).norm(dim=1, keepdim=True)
+            grad = self._grad_3d(gt_vol)
+            grad_norm = grad.norm(dim=1).reshape(T_s, -1)  # [T_s, D³]
+            w = (gt_feats[surface_mask] < voxel * 2).float()  # [T_s, D³]
+            w_sum = w.sum(dim=1).clamp(min=1)
+            mean_gn = (grad_norm * w).sum(dim=1) / w_sum
+            var_gn = ((grad_norm - mean_gn.unsqueeze(1)).pow(2) * w).sum(dim=1) / w_sum
+            block_curvature[surface_mask] = var_gn.sqrt()
 
-            # 只在 MC 插值带内计算 (UDF < v * 1.5)
-            w = (gt_feats[surface_mask] < v * 1.5).float().reshape(T_s, 1, D, D, D)
+        # 2. 邻域曲率梯度: 6-连通邻居间曲率差异
+        complexity = torch.zeros(T, device=device)
+        offsets = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
 
-        # 鼓励 pred 梯度模长至少达到 GT 梯度模长
-        # max(0, gt_norm - pred_norm) → 惩罚梯度不够陡的地方
-        shortfall = F.relu(gt_grad_norm - pred_norm) * w
-        return shortfall.mean()
+        for b, sl in enumerate(layout):
+            bc = coords[sl][:, 1:].long()  # [N_b, 3]
+            curv = block_curvature[sl]
+            is_surf = surface_mask[sl]
+            N_b = bc.shape[0]
+            if N_b <= 1:
+                complexity[sl] = curv
+                continue
+
+            # Hash → index (向量化邻居查找)
+            keys_t = bc[:, 0] * 100003 + bc[:, 1] * 1009 + bc[:, 2]
+            key_to_idx = {k: i for i, k in enumerate(keys_t.tolist())}
+
+            curv_diff_sum = torch.zeros(N_b, device=device)
+            n_surf_nb = torch.zeros(N_b, device=device)
+
+            for dx, dy, dz in offsets:
+                nb_keys = ((bc[:, 0] + dx) * 100003
+                           + (bc[:, 1] + dy) * 1009
+                           + (bc[:, 2] + dz))
+                nb_idx = torch.tensor(
+                    [key_to_idx.get(k, -1) for k in nb_keys.tolist()],
+                    device=device, dtype=torch.long,
+                )
+                valid = nb_idx >= 0
+                safe_idx = nb_idx.clamp(min=0)
+                valid_surf = valid & is_surf[safe_idx]
+
+                nb_curv = curv[safe_idx]
+                curv_diff_sum += (curv - nb_curv).abs() * valid_surf.float()
+                n_surf_nb += valid_surf.float()
+
+            has_nb = n_surf_nb > 0
+            mean_diff = torch.where(
+                has_nb, curv_diff_sum / n_surf_nb,
+                torch.zeros_like(n_surf_nb),
+            )
+
+            # 复杂度 = 自身曲率 + 邻域曲率变化, 再按邻居密度放大
+            local_c = (curv + mean_diff) * (1.0 + n_surf_nb / 6.0)
+            complexity[sl] = local_c
+
+        # Normalize → [1, 1 + boost]
+        cmax, cmin = complexity.max(), complexity.min()
+        if cmax > cmin:
+            complexity = (complexity - cmin) / (cmax - cmin)
+        else:
+            complexity.zero_()
+
+        return 1.0 + boost * complexity
 
     # ------------------------------------------------------------------
     # Training losses
@@ -290,10 +342,12 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             + 1.0 * block_loss_far
         )
 
-        # Complexity reweighting: 表面密度越高的 block 几何越复杂, 权重越大
+        # Complexity reweighting: 连通 block 曲率变化越陡峭 → 权重越大
         with torch.no_grad():
-            surface_density = mc_f.sum(dim=1) / mc_f.shape[1]  # [T], 0~1
-            complexity_w = 1.0 + self.complexity_boost * surface_density
+            complexity_w = self._neighborhood_complexity(
+                x.feats, x.coords, x.layout,
+                self.voxel, self.complexity_boost,
+            )
 
         block_loss = block_loss * complexity_w
         terms["flow_loss"] = block_loss.mean()
@@ -309,11 +363,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         if self.lambda_normal > 0:
             terms["normal_loss"] = self._normal_loss(pred.feats, x.feats)
             terms["loss"] = terms["loss"] + self.lambda_normal * terms["normal_loss"]
-
-        # Gradient Sharpness Loss
-        if self.lambda_sharpness > 0:
-            terms["sharpness_loss"] = self._sharpness_loss(pred.feats, x.feats)
-            terms["loss"] = terms["loss"] + self.lambda_sharpness * terms["sharpness_loss"]
 
         if _profile:
             torch.cuda.synchronize()

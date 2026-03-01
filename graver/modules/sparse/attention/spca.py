@@ -121,7 +121,7 @@ def pool_sparse_tensor(
 
     pooled_sum.scatter_add_(0, inverse.unsqueeze(1).expand(-1, D), feats)
     pooled_cnt.scatter_add_(0, inverse.unsqueeze(1), torch.ones(T, 1, device=feats.device))
-    pooled_feats = pooled_sum / pooled_cnt.clamp(min=1)
+    pooled_feats = (pooled_sum / pooled_cnt.clamp(min=1)).to(feats.dtype)
 
     # 构造池化后的 SparseTensor
     # 重新计算 layout (按 batch 分组)

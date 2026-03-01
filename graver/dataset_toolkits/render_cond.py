@@ -2,8 +2,9 @@ import os
 import argparse
 import json
 import re
-from subprocess import call
+from subprocess import call, TimeoutExpired
 from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,7 @@ from tqdm import tqdm
 
 from utils import sphere_hammersley_sequence
 
-BLENDER_PATH = "/home/ubuntu/yizhao/XGRAVER/blender-3.0.1-linux-x64/blender"
+BLENDER_PATH = "/home/ubuntu/yizhao/blender-3.0.1-linux-x64/blender"
 
 _VIEW_PNG_RE = re.compile(r"^\d{3}\.png$", re.IGNORECASE)
 
@@ -73,13 +74,26 @@ def _render_cond(
     rng = np.random.RandomState(seed)
     offset = (float(rng.rand()), float(rng.rand()))
 
+    # 视角采样：偏向正面斜上方 (pitch 30°~45°, yaw 集中在正前方)
     yaws, pitchs = [], []
     for i in range(int(num_views)):
-        y, p = sphere_hammersley_sequence(i, int(num_views), offset)
-        yaws.append(y)
-        pitchs.append(p)
+        # 70% 概率: 正面偏上 "产品照" 视角
+        # 30% 概率: 完整上半球均匀采样 (保留多样性)
+        if rng.rand() < 0.7:
+            # yaw: 以正前方为中心, ±60° 范围内的截断高斯
+            yaw = float(rng.normal(0, np.pi / 6))          # std=30°
+            yaw = np.clip(yaw, -np.pi / 3, np.pi / 3)     # 截断 ±60°
+            # pitch: 以 37.5° 为中心, std=10° 的截断高斯
+            pitch = float(rng.normal(np.radians(37.5), np.radians(10)))
+            pitch = np.clip(pitch, np.radians(20), np.radians(50))
+        else:
+            y, p = sphere_hammersley_sequence(i, int(num_views), offset)
+            yaw, pitch = float(y), float(p)
+        yaws.append(yaw)
+        pitchs.append(pitch)
 
-    fov_min, fov_max = 10, 70
+    # FOV 收窄到 30°~50°, 与 DINOv2 训练数据的自然视角匹配
+    fov_min, fov_max = 30, 50
     radius_min = np.sqrt(3) / 2 / np.sin(fov_max / 360 * np.pi)
     radius_max = np.sqrt(3) / 2 / np.sin(fov_min / 360 * np.pi)
     k_min = 1 / radius_max**2
@@ -132,8 +146,19 @@ def _render_cond(
 
     stdout_log = os.path.join(output_folder, "blender_stdout.log")
     stderr_log = os.path.join(output_folder, "blender_stderr.log")
-    with open(stdout_log, "w") as _out, open(stderr_log, "w") as _err:
-        result = call(args, stdout=_out, stderr=_err)
+    try:
+        with open(stdout_log, "w") as _out, open(stderr_log, "w") as _err:
+            import subprocess
+            proc = subprocess.Popen(args, stdout=_out, stderr=_err)
+            result = proc.wait(timeout=300)  # 5 分钟超时
+    except (TimeoutExpired, subprocess.TimeoutExpired):
+        proc.kill()
+        proc.wait()
+        print(f"Blender超时(300s) sha256={sha256}")
+        return {"sha256": sha256, "cond_rendered": False}
+    except Exception as e:
+        print(f"Blender异常 sha256={sha256}: {e}")
+        return {"sha256": sha256, "cond_rendered": False}
 
     if result != 0:
         print(f"Blender失败 code={result} sha256={sha256}")
@@ -240,16 +265,23 @@ if __name__ == "__main__":
 
     rendered = []
     if args_list:
-        with Pool(processes=opt.max_workers) as pool:
+        with ProcessPoolExecutor(max_workers=opt.max_workers) as executor:
+            futures = {executor.submit(_apply_render_cond, a): a[1] for a in args_list}
             with tqdm(
-                total=len(args_list),
+                total=len(futures),
                 desc=f"渲染进度 [{opt.rank+1}/{opt.world_size}]",
                 unit="个对象",
                 ncols=80,
             ) as pbar:
-                for result in pool.imap_unordered(_apply_render_cond, args_list):
-                    if result:
-                        rendered.append(result)
+                for future in as_completed(futures):
+                    sha = futures[future]
+                    try:
+                        result = future.result(timeout=360)  # 6 分钟超时
+                        if result:
+                            rendered.append(result)
+                    except Exception as e:
+                        print(f"渲染失败 sha256={sha}: {e}")
+                        rendered.append({"sha256": sha, "cond_rendered": False})
                     pbar.update(1)
 
     rendered = [r for r in rendered if r is not None]

@@ -231,17 +231,19 @@ class Trainer:
                 else:
                     samples[key] = {'value': vis, 'type': 'image'}
 
-        # Gather results
+        # Gather results (NCCL requires CUDA tensors)
         if self.world_size > 1:
             for key in samples.keys():
-                samples[key]['value'] = samples[key]['value'].contiguous()
+                val = samples[key]['value'].contiguous().cuda()
                 if self.is_master:
-                    all_images = [torch.empty_like(samples[key]['value']) for _ in range(self.world_size)]
+                    all_images = [torch.empty_like(val) for _ in range(self.world_size)]
                 else:
                     all_images = []
-                dist.gather(samples[key]['value'], all_images, dst=0)
+                dist.gather(val, all_images, dst=0)
                 if self.is_master:
-                    samples[key]['value'] = torch.cat(all_images, dim=0)[:num_samples]
+                    samples[key]['value'] = torch.cat(all_images, dim=0)[:num_samples].cpu()
+                else:
+                    samples[key]['value'] = val.cpu()
 
         # Save images
         if self.is_master:

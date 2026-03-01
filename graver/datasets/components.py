@@ -123,8 +123,13 @@ class ImageConditionedMixin:
         image = Image.open(image_path)
 
         alpha = np.array(image.getchannel(3))
-        bbox = np.array(alpha).nonzero()
-        bbox = [bbox[1].min(), bbox[0].min(), bbox[1].max(), bbox[0].max()]
+        nz = np.array(alpha).nonzero()
+        if nz[0].size == 0:
+            # alpha 全透明: 用整张图
+            h, w = alpha.shape
+            bbox = [0, 0, w - 1, h - 1]
+        else:
+            bbox = [nz[1].min(), nz[0].min(), nz[1].max(), nz[0].max()]
         center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
         hsize = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) / 2
         aug_size_ratio = 1.2

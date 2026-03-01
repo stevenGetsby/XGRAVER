@@ -14,10 +14,149 @@ from .dense_flow import TimestepEmbedder
 
 
 class SparseFlowModel(nn.Module):
+    """
+    Unified sparse flow transformer for Stage 2 (sub-mask) and Stage 3 (UDF).
+    
+    Config via resolution:
+      Stage 2: resolution=SUBMASK_RES (8), bottleneck_dim=0, submask_resolution=0
+      Stage 3: resolution=BLOCK_DIM (16), bottleneck_dim=128, submask_resolution=SUBMASK_RES (8)
+    """
+
+    # 6-面邻域偏移
+    _FACE_OFFSETS = torch.tensor([
+        [-1,0,0],[1,0,0],[0,-1,0],[0,1,0],[0,0,-1],[0,0,1],
+    ], dtype=torch.long)  # [6, 3]
+
+    # 26-邻域偏移 (6面 + 12棱 + 8角)
+    _NEIGHBOR_OFFSETS = torch.tensor([
+        [-1,0,0],[1,0,0],[0,-1,0],[0,1,0],[0,0,-1],[0,0,1],           # 6 面
+        [-1,-1,0],[-1,1,0],[1,-1,0],[1,1,0],                           # 12 棱
+        [-1,0,-1],[-1,0,1],[1,0,-1],[1,0,1],
+        [0,-1,-1],[0,-1,1],[0,1,-1],[0,1,1],
+        [-1,-1,-1],[-1,-1,1],[-1,1,-1],[-1,1,1],                       # 8 角
+        [1,-1,-1],[1,-1,1],[1,1,-1],[1,1,1],
+    ], dtype=torch.long)  # [26, 3]
+
+    @staticmethod
+    @torch.no_grad()
+    def _compute_coarse_udf_prior(coords: torch.Tensor, layout, block_dim: int) -> torch.Tensor:
+        """
+        从 sparse coords 解析计算粗糙 UDF 模板, 作为 per-token 条件信号.
+        
+        原理: 如果一个 block 的某个面没有邻居, 表面大概率经过那个面.
+        据此构造每个 block 内 BLOCK_DIM³ 个体素的近似距离场.
+        
+        Args:
+            coords: [T, 4] (batch_idx, x, y, z)
+            layout: list of slices
+            block_dim: BLOCK_DIM (e.g. 16)
+            
+        Returns:
+            prior: [T, block_dim³] float, 粗糙 UDF ∈ [0, 1]
+        """
+        T = coords.shape[0]
+        D = block_dim
+        device = coords.device
+        face_offsets = SparseFlowModel._FACE_OFFSETS.to(device)  # [6, 3]
+        
+        # 预计算: 每个体素到 6 个面的归一化距离 [D, D, D, 6]
+        # face 0(-x): dist = i/(D-1),  face 1(+x): dist = 1-i/(D-1)
+        # face 2(-y): dist = j/(D-1),  face 3(+y): dist = 1-j/(D-1)  
+        # face 4(-z): dist = k/(D-1),  face 5(+z): dist = 1-k/(D-1)
+        lin = torch.linspace(0, 1, D, device=device)
+        gx, gy, gz = torch.meshgrid(lin, lin, lin, indexing='ij')  # [D,D,D]
+        face_dists = torch.stack([
+            gx, 1 - gx,       # -x, +x
+            gy, 1 - gy,       # -y, +y
+            gz, 1 - gz,       # -z, +z
+        ], dim=-1)  # [D, D, D, 6]
+        face_dists_flat = face_dists.reshape(-1, 6)  # [D³, 6]
+        
+        prior = torch.ones(T, D**3, device=device)  # 默认: UDF=1 (远离表面)
+        
+        for b, sl in enumerate(layout):
+            bc = coords[sl]  # [N_b, 4]
+            xyz = bc[:, 1:].long()  # [N_b, 3]
+            N_b = xyz.shape[0]
+            if N_b == 0:
+                continue
+            
+            # Hash 查找 6 面邻居
+            P1, P2 = 100003, 1009
+            keys = xyz[:, 0] * P1 + xyz[:, 1] * P2 + xyz[:, 2]
+            sorted_keys, _ = keys.sort()
+            
+            nb_xyz = xyz.unsqueeze(1) + face_offsets.unsqueeze(0)  # [N_b, 6, 3]
+            nb_keys = nb_xyz[:, :, 0] * P1 + nb_xyz[:, :, 1] * P2 + nb_xyz[:, :, 2]
+            
+            flat_nb = nb_keys.reshape(-1)
+            pos = torch.searchsorted(sorted_keys, flat_nb).clamp(max=N_b - 1)
+            has_neighbor = (sorted_keys[pos] == flat_nb).reshape(N_b, 6)  # [N_b, 6]
+            
+            # 没有邻居的面 → 表面经过那里 → 距离 = 到该面的距离
+            # 有邻居的面 → 远离表面 → 距离 = 1.0 (不贡献)
+            boundary_dist = face_dists_flat.unsqueeze(0).expand(N_b, -1, -1).clone()  # [N_b, D³, 6]
+            # 有邻居的面: 距离设为 1.0 (不影响 min)
+            has_nb_expanded = has_neighbor.unsqueeze(1).expand(-1, D**3, -1)  # [N_b, D³, 6]
+            boundary_dist[has_nb_expanded] = 1.0
+            
+            # 取 6 个面距离的最小值 → 粗糙 UDF
+            block_prior = boundary_dist.min(dim=-1).values  # [N_b, D³]
+            prior[sl] = block_prior
+        
+        return prior
+
+    @staticmethod
+    @torch.no_grad()
+    def _compute_neighbor_occupancy(coords: torch.Tensor, layout) -> torch.Tensor:
+        """
+        从 sparse coords 计算每个 block 的 26 邻域 occupancy pattern.
+        
+        Args:
+            coords: [T, 4] (batch_idx, x, y, z)
+            layout: list of slices
+            
+        Returns:
+            occ: [T, 26] float, 0/1 表示邻居是否存在
+        """
+        T = coords.shape[0]
+        device = coords.device
+        offsets = SparseFlowModel._NEIGHBOR_OFFSETS.to(device)  # [26, 3]
+        
+        occ = torch.zeros(T, 26, device=device)
+        
+        for b, sl in enumerate(layout):
+            bc = coords[sl]  # [N_b, 4]
+            xyz = bc[:, 1:].long()  # [N_b, 3]
+            N_b = xyz.shape[0]
+            if N_b == 0:
+                continue
+            
+            # 用 hash 做快速查找
+            P1, P2 = 100003, 1009
+            keys = xyz[:, 0] * P1 + xyz[:, 1] * P2 + xyz[:, 2]  # [N_b]
+            
+            # 26 方向的邻居坐标 → hash
+            nb_xyz = xyz.unsqueeze(1) + offsets.unsqueeze(0)  # [N_b, 26, 3]
+            nb_keys = (nb_xyz[:, :, 0] * P1 
+                     + nb_xyz[:, :, 1] * P2 
+                     + nb_xyz[:, :, 2])  # [N_b, 26]
+            
+            # 排序 + searchsorted 查找
+            sorted_keys, sort_idx = keys.sort()
+            flat_nb = nb_keys.reshape(-1)
+            pos = torch.searchsorted(sorted_keys, flat_nb).clamp(max=N_b - 1)
+            matched = sorted_keys[pos] == flat_nb
+            
+            occ[sl] = matched.reshape(N_b, 26).float()
+        
+        return occ
 
     def __init__(
         self,
-        bottleneck_dim: int = 128,
+        resolution: int = 0,
+        bottleneck_dim: int = 0,
+        submask_resolution: int = 0,
         model_channels: int = 256,
         cond_channels: int = 1024,
         num_blocks: int = 8,
@@ -57,21 +196,37 @@ class SparseFlowModel(nn.Module):
         self.num_context_registers = num_context_registers
         self.context_start_block = context_start_block
 
-        block_dim = BLOCK_DIM ** 3
-        out_dim = BLOCK_DIM ** 3
+        # resolution → token_dim (default: BLOCK_DIM for Stage 3)
+        resolution = resolution if resolution > 0 else BLOCK_DIM
+        token_dim = resolution ** 3
+        self.resolution = resolution
+        self.token_dim = token_dim
+
+        # submask conditioning (0 = disabled)
+        submask_dim = submask_resolution ** 3 if submask_resolution > 0 else 0
+        self.submask_resolution = submask_resolution
 
         if kwargs:
             print(f"[SparseFlowModel] ignored: {list(kwargs.keys())}")
 
-        self.embed = nn.Sequential(
-            nn.Linear(block_dim, bottleneck_dim, bias=False),
-            nn.Linear(bottleneck_dim, model_channels),
-        )
+        # Input embedding: bottleneck or direct
+        if bottleneck_dim > 0:
+            self.embed = nn.Sequential(
+                nn.Linear(token_dim, bottleneck_dim, bias=False),
+                nn.Linear(bottleneck_dim, model_channels),
+            )
+        else:
+            self.embed = nn.Linear(token_dim, model_channels)
 
-        self.predict = nn.Sequential(
-            nn.Linear(model_channels, bottleneck_dim),
-            nn.Linear(bottleneck_dim, out_dim),
-        )
+        # Optional sub-mask conditioning (Stage 3 only)
+        if submask_dim > 0:
+            self.mask_embed = nn.Sequential(
+                nn.Linear(submask_dim, 128),
+                nn.SiLU(),
+                nn.Linear(128, model_channels),
+            )
+
+        self.predict = nn.Linear(model_channels, token_dim)
 
         self.final_norm = LayerNorm32(model_channels, elementwise_affine=False, eps=1e-6)
 
@@ -147,10 +302,9 @@ class SparseFlowModel(nn.Module):
             self.convert_to_fp16()
 
         n_params = sum(p.numel() for p in self.parameters()) / 1e6
-        print(f"[SparseFlowModel] BLOCK_DIM={BLOCK_DIM}, "
-              f"{block_dim}>{bottleneck_dim}>{model_channels}"
-              f">x{num_blocks}"
-              f">{model_channels}>{bottleneck_dim}>{out_dim}, "
+        print(f"[SparseFlowModel] res={resolution}, token_dim={token_dim}, "
+              f"bottleneck={bottleneck_dim}, submask_res={submask_resolution}, "
+              f"hidden={model_channels}x{num_blocks}, "
               f"attn={attn_mode}, w={window_size}, heads={self.num_heads}, "
               f"fp16={use_fp16}, params={n_params:.1f}M")
         if num_pooled_layers > 0:
@@ -193,17 +347,28 @@ class SparseFlowModel(nn.Module):
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        nn.init.zeros_(self.predict[-1].weight)
-        nn.init.zeros_(self.predict[-1].bias)
+        nn.init.zeros_(self.predict.weight)
+        nn.init.zeros_(self.predict.bias)
+
+        # mask_embed zero-init (if present)
+        if hasattr(self, 'mask_embed'):
+            nn.init.zeros_(self.mask_embed[-1].weight)
+            nn.init.zeros_(self.mask_embed[-1].bias)
 
     def forward(
         self,
         x: sp.SparseTensor,
         t: torch.Tensor,
         cond: torch.Tensor,
+        submask: torch.Tensor = None,
         return_decoder_feats: bool = False,
     ) -> Union[sp.SparseTensor, Tuple[sp.SparseTensor, sp.SparseTensor]]:
         h_feats = self.embed(x.feats).type(self.dtype)
+
+        # Optional sub-mask conditioning
+        if submask is not None and hasattr(self, 'mask_embed'):
+            mask_emb = self.mask_embed(submask).type(self.dtype)
+            h_feats = h_feats + mask_emb
 
         h = sp.SparseTensor(
             feats=h_feats,

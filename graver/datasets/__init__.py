@@ -3,6 +3,8 @@ import importlib
 __attributes = {
     'BlockCoords': 'block_coords',
     'ImageConditionedBlockCoords': 'block_coords',
+    'BlockSubmask': 'block_submask',
+    'ImageConditionedBlockSubmask': 'block_submask',
     'BlockFeats': 'block_feats',
     'TextConditionedBlockFeats': 'block_feats',
     'ImageConditionedBlockFeats': 'block_feats',

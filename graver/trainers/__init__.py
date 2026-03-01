@@ -5,6 +5,7 @@ __attributes = {
     'FlowMatchingTrainer': 'flow_matching.flow_matching',
     'FlowMatchingCFGTrainer': 'flow_matching.flow_matching',
     'ImageConditionedFlowMatchingCFGTrainer': 'flow_matching.flow_matching',
+    'ImageConditionedSparseMaskFlowCFGTrainer': 'flow_matching.mask_matching',
     'ImageConditionedSparseFlowMultiTokenCFGTrainer': 'flow_matching.sr_matching',
 }
 

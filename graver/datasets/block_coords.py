@@ -7,13 +7,13 @@ import utils3d
 from .components import StandardDatasetBase, ImageConditionedMixin
 from ..representations.octree import DfsOctree as Octree
 from ..renderers import OctreeRenderer
-from ..dataset_toolkits.mesh2block import BLOCK_GRID, BLOCK_INNER
+from ..dataset_toolkits.mesh2block import BLOCK_GRID, COL_PREFIX, BLOCK_FOLDER
 
 
 class BlockCoords(StandardDatasetBase):
     """
     Block coordinates dataset for Stage 1 (Dense Flow).
-    Loads block coords from npz and constructs BLOCK_GRID³ occupancy grid.
+    Loads block coords from npz and constructs BLOCK_GRID³ (64³) binary occupancy grid.
     """
 
     def __init__(self,
@@ -22,14 +22,14 @@ class BlockCoords(StandardDatasetBase):
         min_block_num: int = 0,
         min_aesthetic_score: float = 5.0,
     ):
-        self.resolution = BLOCK_GRID
+        self.resolution = BLOCK_GRID  # 64
         self.max_block_num = max_block_num
         self.min_block_num = min_block_num
         self.min_aesthetic_score = min_aesthetic_score
         self.value_range = (0, 1)
 
-        self._col_prefix = f'{BLOCK_GRID}_{BLOCK_INNER}'
-        self._block_prefix = f'blocks_{self._col_prefix}'
+        self._col_prefix = COL_PREFIX
+        self._block_prefix = BLOCK_FOLDER
 
         super().__init__(roots)
         
@@ -51,14 +51,16 @@ class BlockCoords(StandardDatasetBase):
     def get_instance(self, root, instance):
         npz_path = os.path.join(root, self._block_prefix, f'{instance}.npz')
         with np.load(npz_path) as data:
-            coords = data['coords']  # Shape: (N, 3), dtype: uint8/int
-        
+            coords = data['coords']  # Shape: (N, 3) in 64³
+
         coords = torch.from_numpy(coords).long()
+
+        # 构造 BLOCK_GRID³ (64³) binary occupancy grid
         ss = torch.zeros(1, self.resolution, self.resolution, self.resolution, dtype=torch.float32)
-        mask = (coords >= 0) & (coords < self.resolution)
+        mask = (coords >= 0) & (coords < BLOCK_GRID)
         valid_coords = coords[mask.all(dim=1)]
-        
-        ss[0, valid_coords[:, 0], valid_coords[:, 1], valid_coords[:, 2]] = 1.0
+        for c in valid_coords:
+            ss[0, c[0], c[1], c[2]] = 1.0
 
         return {'x_0': ss}
 

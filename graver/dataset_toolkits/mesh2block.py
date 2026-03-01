@@ -5,28 +5,63 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import open3d as o3d
-import pymeshlab
 
 
-BLOCK_GRID = 128                               # 每轴 block 数
-BLOCK_INNER = 7                                # 每 block 核心采样间隔数
-PADDING = 0                                    # 每侧 padding 采样点数
+BLOCK_GRID = 64                                 # 每轴 block 数
+BLOCK_INNER = 15                                # 每 block 核心采样间隔数
 
-BLOCK_DIM = BLOCK_INNER + 1 + 2 * PADDING     # 8 = 每 block 总采样维度
-BLOCK_CORE_VERTS = BLOCK_INNER + 1             # 8 = 核心区域顶点数
-SAMPLE_RES = BLOCK_GRID * BLOCK_INNER          # 896 = 全局采样分辨率
-VOXEL_SIZE = 1.0 / SAMPLE_RES                  # ~0.00112
+BLOCK_DIM = BLOCK_INNER + 1                     # 每 block 采样维度 (顶点数)
+SAMPLE_RES = BLOCK_GRID * BLOCK_INNER           # 全局采样分辨率
+VOXEL_SIZE = 1.0 / SAMPLE_RES
 
 # UDF 截断: 按体素数, 不按 block 宽度
-UDF_TRUNC_VOXELS = 5                           # 截断体素数
-TRUNCATION = UDF_TRUNC_VOXELS * VOXEL_SIZE     # 5/896 ≈ 0.00558
-MC_THRESHOLD = 1.0 / UDF_TRUNC_VOXELS          # 1/5 = 0.2 (1 voxel in UDF space)
+UDF_TRUNC_VOXELS = 5                            # 截断体素数
+TRUNCATION = UDF_TRUNC_VOXELS * VOXEL_SIZE      # 5/896 ≈ 0.00558
+MC_THRESHOLD = 1.0 / UDF_TRUNC_VOXELS           # 1/5 = 0.2 (1 voxel in UDF space)
 SURFACE_THRESHOLD = 2 * MC_THRESHOLD            # 2/5 = 0.4
 
 # GPU BVH 面数上限
 MAX_FACES_FOR_BVH = 1000_000
 
+# Per-block sub-mask: 从 UDF 直接提取, 标记 MC 表面穿越的子区域
+SUBMASK_RES = 8                                 # sub-mask 每轴分辨率 (可调, 需整除 BLOCK_DIM)
+SUBMASK_STRIDE = BLOCK_DIM // SUBMASK_RES       # 每个 sub-cell 覆盖的 UDF 体素数
+SUBMASK_DIM = SUBMASK_RES ** 3                  # per-block mask 展平维度
 
+assert BLOCK_DIM % SUBMASK_RES == 0, f"BLOCK_DIM({BLOCK_DIM}) must be divisible by SUBMASK_RES({SUBMASK_RES})"
+
+# ---- 全局命名前缀 (文件夹 + metadata 列名) ----
+COL_PREFIX = f'{BLOCK_GRID}_{BLOCK_INNER}_occ{SUBMASK_RES}'
+BLOCK_FOLDER = f'blocks_{COL_PREFIX}'
+
+
+# ===================== sub-mask: 从 UDF 直接提取 =====================
+
+def extract_submask_from_udf(udf: np.ndarray) -> np.ndarray:
+    """
+    从 per-block UDF 直接计算 binary sub-mask.
+    
+    将每个 block 的 BLOCK_DIM³ UDF 划分为 SUBMASK_RES³ 个子区域,
+    每个子区域覆盖 SUBMASK_STRIDE³ 个 UDF 体素.
+    若子区域内任何体素的 UDF < SURFACE_THRESHOLD, 则标记为 1 (MC 表面穿越).
+    
+    Args:
+        udf: [N, BLOCK_DIM³] float, 归一化 UDF ∈ [0, 1]
+        
+    Returns:
+        submask: [N, SUBMASK_DIM] float32, binary (0/1)
+    """
+    N = len(udf)
+    D = BLOCK_DIM
+    R = SUBMASK_RES
+    S = SUBMASK_STRIDE
+    
+    # [N, D, D, D] → [N, R, S, R, S, R, S] → min over stride axes
+    vol = udf.reshape(N, R, S, R, S, R, S)
+    sub_min = vol.min(axis=(2, 4, 6))  # [N, R, R, R]
+    submask = (sub_min < SURFACE_THRESHOLD).astype(np.float32)
+    
+    return submask.reshape(N, -1)
 
 
 # ===================== mesh I/O =====================
@@ -63,8 +98,9 @@ def load_mesh(path: str, verbose: bool = True):
 
 def _simplify_for_bvh(mesh: o3d.t.geometry.TriangleMesh,
                        max_faces: int = MAX_FACES_FOR_BVH,
-                       verbose: bool = True) -> o3d.t.geometry.TriangleMesh:
-    """面数超过 max_faces 时用 PyMeshLab 简化, 避免 cubvh BVH 栈溢出。"""
+                       verbose: bool = True,
+                       device: str = 'cpu') -> o3d.t.geometry.TriangleMesh:
+    """面数超过 max_faces 时用 CuMesh GPU 简化, 避免 cubvh BVH 栈溢出。"""
     n_faces = len(mesh.triangle.indices.numpy())
     if n_faces <= max_faces:
         return mesh
@@ -72,23 +108,24 @@ def _simplify_for_bvh(mesh: o3d.t.geometry.TriangleMesh,
     if verbose:
         print(f"⚠️  Mesh has {n_faces} faces (>{max_faces}), simplifying for BVH …")
 
-    # 用 PyMeshLab QEM 简化
-    ms = pymeshlab.MeshSet()
-    v_np = mesh.vertex.positions.numpy().astype(np.float64)
+    from cumesh import CuMesh
+    v_np = mesh.vertex.positions.numpy().astype(np.float32)
     f_np = mesh.triangle.indices.numpy().astype(np.int32)
-    ms.add_mesh(pymeshlab.Mesh(v_np, f_np))
-    ms.meshing_decimation_quadric_edge_collapse(targetfacenum=max_faces,
-                                                 preservetopology=True)
-    m = ms.current_mesh()
-    v_new = m.vertex_matrix().astype(np.float32)
-    f_new = m.face_matrix().astype(np.int32)
+    dev = device if device != 'cpu' else 'cuda'
+    v_cuda = torch.from_numpy(v_np).float().to(dev)
+    f_cuda = torch.from_numpy(f_np).int().to(dev)
+    cm = CuMesh()
+    cm.init(v_cuda, f_cuda)
+    cm.simplify(target_num_faces=max_faces, verbose=verbose)
+    v_new = cm.vertices.cpu().numpy()
+    f_new = cm.faces.cpu().numpy().astype(np.int32)
 
     simplified = o3d.t.geometry.TriangleMesh()
     simplified.vertex.positions = o3d.core.Tensor(v_new, dtype=o3d.core.float32)
     simplified.triangle.indices = o3d.core.Tensor(f_new, dtype=o3d.core.int32)
 
     if verbose:
-        print(f"   ✅ Simplified: {n_faces} → {len(f_new)} faces")
+        print(f"   ✅ Simplified: {n_faces} → {len(f_new)} faces (GPU)")
     return simplified
 
 
@@ -135,11 +172,11 @@ def compute_block_udf(mesh, block_coords: np.ndarray,
                       verbose: bool = True,
                       device: str = 'cpu', bvh=None) -> np.ndarray:
     """
-    计算每个 block 的 BLOCK_DIM³ (13³) UDF, 含 padding。
+    计算每个 block 的 BLOCK_DIM³ UDF。
 
     坐标映射:
       block (bx, by, bz) in BLOCK_GRID³
-      → 局部偏移 [-PADDING, BLOCK_CORE_VERTS + PADDING)
+      → 局部偏移 [0, BLOCK_DIM)
       → 全局采样坐标 = bx * BLOCK_INNER + offset
       → 物理坐标 = global_idx * VOXEL_SIZE - 0.5
     """
@@ -151,7 +188,7 @@ def compute_block_udf(mesh, block_coords: np.ndarray,
 
     n = len(block_coords)
 
-    lr = torch.arange(-PADDING, BLOCK_CORE_VERTS + PADDING, dtype=torch.long)
+    lr = torch.arange(BLOCK_DIM, dtype=torch.long)
     lx, ly, lz = torch.meshgrid(lr, lr, lr, indexing="ij")
     local = torch.stack([lx, ly, lz], dim=-1).reshape(-1, 3)  # [BLOCK_DIM³, 3]
 
@@ -216,17 +253,13 @@ def compute_block_udf(mesh, block_coords: np.ndarray,
 # ===================== reconstruction =====================
 
 def extract_voxels(coords, fine_feats, keep_band=0.03, verbose=True):
-    """从 BLOCK_DIM³ block 中提取中心 BLOCK_CORE_VERTS³, 构造 MC 输入"""
+    """从 BLOCK_DIM³ block 提取 MC 输入"""
     coords = np.asarray(coords, dtype=np.int32)
     n = len(coords)
 
-    F_full = np.asarray(fine_feats, dtype=np.float32).reshape(
+    F_core = np.asarray(fine_feats, dtype=np.float32).reshape(
         n, BLOCK_DIM, BLOCK_DIM, BLOCK_DIM,
     )
-    p = PADDING
-    F_core = F_full[:, p:p + BLOCK_CORE_VERTS,
-                       p:p + BLOCK_CORE_VERTS,
-                       p:p + BLOCK_CORE_VERTS]
 
     vx, vy, vz = np.meshgrid(
         np.arange(BLOCK_INNER),
@@ -287,9 +320,13 @@ def reconstruct_mesh(npz_path: str, ply_path: str,
     t0 = time.time()
     data = np.load(npz_path)
 
+    raw_feats = data["fine_feats"]
+    if raw_feats.dtype == np.float16:
+        raw_feats = raw_feats.astype(np.float32)
+
     all_coords, all_logits = extract_voxels(
         coords=data["coords"],
-        fine_feats=data["fine_feats"],
+        fine_feats=raw_feats,
         keep_band=keep_band,
         verbose=verbose,
     )
@@ -308,16 +345,24 @@ def reconstruct_mesh(npz_path: str, ply_path: str,
 
     v = (v / SAMPLE_RES) - 0.5
 
-    ms = pymeshlab.MeshSet()
-    ms.add_mesh(pymeshlab.Mesh(v.astype(np.float32), f.astype(np.int32)))
-    ms.apply_filter("meshing_remove_duplicate_vertices")
-    ms.apply_filter("meshing_remove_duplicate_faces")
-    ms.apply_filter("meshing_remove_null_faces")
-    ms.apply_filter("meshing_remove_connected_component_by_face_number",
-                     mincomponentsize=10)
-    ms.apply_filter("apply_coord_laplacian_smoothing",
-                     stepsmoothnum=3, cotangentweight=False)
-    ms.save_current_mesh(ply_path)
+    # 后处理: CuMesh GPU 清理 + Open3D Laplacian 平滑
+    from cumesh import CuMesh
+    v_cuda = torch.from_numpy(v.astype(np.float32)).cuda()
+    f_cuda = torch.from_numpy(f.astype(np.int32)).cuda()
+    cm = CuMesh()
+    cm.init(v_cuda, f_cuda)
+    cm.remove_duplicate_faces()
+    cm.remove_degenerate_faces()
+    cm.remove_small_connected_components(min_area=1e-6)
+    v_clean = cm.vertices.cpu().numpy().astype(np.float64)
+    f_clean = cm.faces.cpu().numpy().astype(np.int32)
+
+    # Laplacian 平滑: Open3D legacy
+    legacy = o3d.geometry.TriangleMesh()
+    legacy.vertices = o3d.utility.Vector3dVector(v_clean)
+    legacy.triangles = o3d.utility.Vector3iVector(f_clean)
+    legacy = legacy.filter_smooth_laplacian(number_of_iterations=3)
+    o3d.io.write_triangle_mesh(ply_path, legacy)
 
     if verbose:
         print(f"✅ Saved to {ply_path}")
@@ -329,6 +374,88 @@ def reconstruct_mesh(npz_path: str, ply_path: str,
 reconstruct_adaptive_mc = reconstruct_mesh
 
 
+# ===================== 合并检测 + UDF 计算 =====================
+
+def _detect_and_compute_udf(mesh, verbose=True, device='cpu', bvh=None):
+    """
+    合并 detect_active_blocks + compute_block_udf 为一次 BVH 查询.
+    
+    原来的流程:
+      1. detect: 查询 64³=262K 个 block 中心点的距离 → 找到 active blocks
+      2. compute: 对 active blocks 查询 N×BLOCK_DIM³ 个精细点的 UDF
+    
+    优化: 在 GPU 模式下, 直接把检测和 UDF 计算合并,
+    用粗糙的 block 中心距离预筛选, 然后只对 active blocks 算精细 UDF.
+    整个过程只构造一次查询张量, 减少 CPU↔GPU 拷贝次数.
+    """
+    use_gpu = (device != 'cpu' and bvh is not None)
+    
+    if not use_gpu:
+        # CPU 路径: 保持原来的两步流程
+        coords = detect_active_blocks(mesh, verbose=verbose, device=device, bvh=bvh)
+        udf = compute_block_udf(mesh, coords, verbose=verbose, device=device, bvh=bvh)
+        return coords, udf
+    
+    # ---- GPU 合并路径 ----
+    spacing = 1.0 / BLOCK_GRID
+    
+    # Step 1: 粗筛 - block 中心点距离 (复用已建好的 bvh)
+    vals = torch.linspace(-0.5 + spacing / 2, 0.5 - spacing / 2, BLOCK_GRID)
+    gx, gy, gz = torch.meshgrid(vals, vals, vals, indexing="ij")
+    center_pts = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3).to(device)
+    
+    d_center, _, _ = bvh.unsigned_distance(center_pts, return_uvw=False)
+    threshold = (np.sqrt(3) * spacing) / 2.0 * 1.1
+    active = d_center <= threshold
+    
+    idx = torch.nonzero(active).squeeze(1)
+    ix = idx // (BLOCK_GRID ** 2)
+    iy = (idx % (BLOCK_GRID ** 2)) // BLOCK_GRID
+    iz = idx % BLOCK_GRID
+    coords = torch.stack([ix, iy, iz], dim=1).cpu().numpy().astype(np.int32)
+    
+    if verbose:
+        print(f"✅ Active blocks: {len(coords)}")
+    
+    # Step 2: 精细 UDF - 直接在 GPU 上构造查询点
+    n = len(coords)
+    lr = torch.arange(BLOCK_DIM, dtype=torch.long)
+    lx, ly, lz = torch.meshgrid(lr, lr, lr, indexing="ij")
+    local = torch.stack([lx, ly, lz], dim=-1).reshape(-1, 3)  # [BLOCK_DIM³, 3]
+    
+    b_all = torch.from_numpy(coords).long()
+    gvidx = b_all[:, None, :] * BLOCK_INNER + local[None, :, :]
+    q_all = (gvidx.float() * VOXEL_SIZE) - 0.5
+    q_flat = q_all.reshape(-1, 3).clamp(-0.5, 0.5 - 1e-6)
+    
+    total_pts = q_flat.shape[0]
+    MAX_PTS = 50_000_000
+    
+    if total_pts <= MAX_PTS:
+        q_cuda = q_flat.to(device)
+        d, _, _ = bvh.unsigned_distance(q_cuda, return_uvw=False)
+        d_np = d.cpu().numpy()
+    else:
+        d_parts = []
+        bs_pts = MAX_PTS
+        it = range(0, total_pts, bs_pts)
+        if verbose:
+            it = tqdm(it, desc="Computing Block UDF (GPU)")
+        for s in it:
+            e = min(s + bs_pts, total_pts)
+            q_cuda = q_flat[s:e].to(device)
+            d_chunk, _, _ = bvh.unsigned_distance(q_cuda, return_uvw=False)
+            d_parts.append(d_chunk.cpu().numpy())
+        d_np = np.concatenate(d_parts)
+    
+    udf = np.clip(d_np / TRUNCATION, 0.0, 1.0).reshape(n, -1).astype(np.float32)
+    
+    if verbose:
+        print(f"✅ Block UDF computed: {n} blocks × {BLOCK_DIM}³")
+    
+    return coords, udf
+
+
 # ===================== pipeline =====================
 
 def generate_adaptive_udf(input_path: str, output_npz_path: str,
@@ -337,8 +464,9 @@ def generate_adaptive_udf(input_path: str, output_npz_path: str,
         print(f"\n{'=' * 60}")
         print(f"Generating Block UDF Data (device={device})")
         print(f"{'=' * 60}")
-        print(f"📏 Block grid: {BLOCK_GRID}³, Block dim: {BLOCK_DIM}³ "
-              f"(core {BLOCK_CORE_VERTS}³ + pad {PADDING})")
+        print(f"📏 Prefix: {COL_PREFIX} → folder: {BLOCK_FOLDER}")
+        print(f"📏 Block grid: {BLOCK_GRID}³, Block dim: {BLOCK_DIM}³")
+        print(f"📏 Sub-mask: {SUBMASK_RES}³={SUBMASK_DIM}d (stride={SUBMASK_STRIDE})")
         print(f"📏 Sample res: {SAMPLE_RES}³, Voxel: {VOXEL_SIZE:.6f}")
         print(f"📏 Truncation: {TRUNCATION:.6f}, "
               f"Surface: {SURFACE_THRESHOLD}, MC: {MC_THRESHOLD}")
@@ -348,7 +476,7 @@ def generate_adaptive_udf(input_path: str, output_npz_path: str,
 
     # GPU 模式下, 如果面数太多则先简化, 防止 cubvh BVH 栈溢出
     if device != 'cpu':
-        mesh = _simplify_for_bvh(mesh, verbose=verbose)
+        mesh = _simplify_for_bvh(mesh, verbose=verbose, device=device)
 
     # 构建 GPU BVH (如果使用 GPU)
     bvh = None
@@ -365,15 +493,12 @@ def generate_adaptive_udf(input_path: str, output_npz_path: str,
                 print(f"⚠️ cubvh init failed ({e}), falling back to CPU")
             device = 'cpu'
 
-    # 1. 检测活跃 block
-    coords = detect_active_blocks(mesh, verbose=verbose,
-                                   device=device, bvh=bvh)
+    # 1. 检测活跃 block + 计算 UDF (合并查询, 减少 BVH 调用次数)
+    coords, udf = _detect_and_compute_udf(
+        mesh, verbose=verbose, device=device, bvh=bvh
+    )
 
-    # 2. 直接计算 BLOCK_DIM³ UDF
-    udf = compute_block_udf(mesh, coords, verbose=verbose,
-                             device=device, bvh=bvh)
-
-    # 3. 只保留表面 block (任意 UDF < 阈值)
+    # 2. 只保留表面 block (任意 UDF < 阈值)
     min_udf = udf.min(axis=1)
     has_surface = min_udf < SURFACE_THRESHOLD
     n_total = len(coords)
@@ -382,12 +507,22 @@ def generate_adaptive_udf(input_path: str, output_npz_path: str,
     coords_s = coords[has_surface]
     udf_s = udf[has_surface]
 
-    # 4. 保存
-    np.savez(
+    # 从 UDF 直接提取 sub-mask
+    submask_s = extract_submask_from_udf(udf_s)
+
+    # 3. 保存: float16 + gzip 压缩
+    os.makedirs(os.path.dirname(output_npz_path), exist_ok=True)
+    np.savez_compressed(
         output_npz_path,
-        coords=coords_s,      # (M, 3)
-        fine_feats=udf_s,     # (M, BLOCK_DIM³)
+        coords=coords_s,                        # (M, 3) int32
+        fine_feats=udf_s.astype(np.float16),     # (M, BLOCK_DIM³) float16
+        submask=submask_s,                       # (M, SUBMASK_DIM) float32
     )
+
+    # 显式释放 GPU 显存
+    del bvh
+    if device != 'cpu':
+        torch.cuda.empty_cache()
 
     if verbose:
         print(f"\n✅ Saved to {output_npz_path}")

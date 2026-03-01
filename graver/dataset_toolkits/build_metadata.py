@@ -6,17 +6,32 @@ from pathlib import Path
 from typing import Iterable, List, Dict
 from tqdm import tqdm
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 DEFAULT_FIELDS = ["sha256", "local_path", "rendered"]
 
 
 def calculate_sha256(file_path: Path) -> str:
-    """Calculate the SHA256 hash of a file."""
+    """Calculate the SHA256 hash of a file (read in 1MB chunks for speed)."""
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
+        for byte_block in iter(lambda: f.read(1 << 20), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+
+def _process_one(args_tuple):
+    """Worker: (file_path_str, root_path_str) -> dict or None"""
+    file_path_str, root_path_str = args_tuple
+    file_path = Path(file_path_str)
+    root_path = Path(root_path_str)
+    try:
+        sha256 = calculate_sha256(file_path)
+        local_path = str(file_path.relative_to(root_path))
+        return {"sha256": sha256, "local_path": local_path}
+    except Exception as exc:
+        print(f"Error processing {file_path}: {exc}")
+        return None
 
 
 def has_render_outputs(root_path: Path, sha256: str) -> bool:
@@ -131,16 +146,24 @@ def build_metadata(root_dir, raw_dir_name="raw", output_filename="metadata.csv",
     print(f"Scanning for .glb files in {raw_path}...")
     all_files = list(raw_path.rglob("*.glb"))
 
-    new_rows: List[Dict[str, str]] = []
-    for file_path in tqdm(all_files, desc="Processing"):
+    # Filter out already-processed files
+    to_process = []
+    for file_path in all_files:
         local_path = str(file_path.relative_to(root_path))
-        if local_path in existing_files:
-            continue
-        try:
-            sha256 = calculate_sha256(file_path)
-            new_rows.append({"sha256": sha256, "local_path": local_path})
-        except Exception as exc:
-            print(f"Error processing {file_path}: {exc}")
+        if local_path not in existing_files:
+            to_process.append((str(file_path), str(root_path)))
+
+    print(f"Found {len(all_files)} .glb files, {len(to_process)} new to process.")
+
+    new_rows: List[Dict[str, str]] = []
+    if to_process:
+        num_workers = min(os.cpu_count() or 4, 32, len(to_process))
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_process_one, t): t for t in to_process}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Hashing"):
+                result = future.result()
+                if result is not None:
+                    new_rows.append(result)
 
     total_new = len(new_rows)
     total_existing = len(existing_rows)
@@ -159,9 +182,15 @@ def build_metadata(root_dir, raw_dir_name="raw", output_filename="metadata.csv",
         print("No entries found. Nothing to write.")
         return
 
+    # Batch check render directories (set lookup instead of per-row stat)
+    render_dir = root_path / "render"
+    if render_dir.exists():
+        rendered_set = set(os.listdir(render_dir))
+    else:
+        rendered_set = set()
     for row in all_rows:
         sha256 = row.get("sha256", "")
-        row["rendered"] = has_render_outputs(root_path, sha256)
+        row["rendered"] = sha256 in rendered_set
 
     print(f"Writing {len(all_rows)} entries to {output_path} (new: {total_new}, existing: {total_existing}).")
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:

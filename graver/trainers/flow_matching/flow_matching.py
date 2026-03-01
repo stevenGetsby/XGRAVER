@@ -61,11 +61,13 @@ class FlowMatchingTrainer(BasicTrainer):
             }
         },
         cond_noise_std: float = 0.0,
+        noise_scale: float = 1.0,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.t_schedule = t_schedule
         self.cond_noise_std = cond_noise_std
+        self.noise_scale = noise_scale
 
     def diffuse(self, x_0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -158,7 +160,7 @@ class FlowMatchingTrainer(BasicTrainer):
             a dict with the key "loss" containing a tensor of shape [N].
             may also contain other keys for different terms.
         """
-        noise = torch.randn_like(x_0)
+        noise = torch.randn_like(x_0) * self.noise_scale
         t = self.sample_t(x_0.shape[0]).to(x_0.device).float()
         x_t = self.diffuse(x_0, t, noise=noise)
         cond = self.get_cond(cond, **kwargs)
@@ -205,12 +207,18 @@ class FlowMatchingTrainer(BasicTrainer):
         batch_size: int,
         verbose: bool = False,
     ) -> Dict:
+        # 优先使用 test_dataset，否则 fallback 到训练集
+        if hasattr(self, 'test_dataset') and self.test_dataset is not None:
+            snap_dataset = self.test_dataset
+        else:
+            snap_dataset = copy.deepcopy(self.dataset)
+
         dataloader = DataLoader(
-            copy.deepcopy(self.dataset),
+            snap_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=0,
-            collate_fn=self.dataset.collate_fn if hasattr(self.dataset, 'collate_fn') else None,
+            collate_fn=snap_dataset.collate_fn if hasattr(snap_dataset, 'collate_fn') else None,
         )
 
         # inference
@@ -224,7 +232,7 @@ class FlowMatchingTrainer(BasicTrainer):
             batch = min(batch_size, num_samples - i)
             data = next(iter(dataloader))
             data = {k: v[:batch].cuda() if isinstance(v, torch.Tensor) else v[:batch] for k, v in data.items()}
-            noise = torch.randn_like(data['x_0'])
+            noise = torch.randn_like(data['x_0']) * self.noise_scale
             sample_gt.append(data['x_0'])
             cond_vis.append(self.vis_cond(**data))
             del data['x_0']

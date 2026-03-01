@@ -3,18 +3,18 @@
         "denoiser": {
             "name": "SparseFlowModel",
             "args": {
-                "bottleneck_dim": 256,
-                "model_channels": 1280,
+                "resolution": 0,
+                "bottleneck_dim": 128,
+                "submask_resolution": 8,
+                "model_channels": 768,
                 "cond_channels": 1024,
-                "num_blocks": 32,
-                "num_heads": 20,
+                "num_blocks": 12,
+                "num_pooled_layers": 4,
+                "num_heads": 12,
                 "mlp_ratio": 4,
                 "pe_mode": "rope",
                 "attn_mode": "windowed",
                 "window_size": 32,
-                "pool_stride": 4,
-                "pool_stride_coarse": 8,
-                "num_pooled_layers": 0,
                 "use_fp16": true,
                 "qk_rms_norm": true,
                 "qk_rms_norm_cross": true,
@@ -28,9 +28,9 @@
         "name": "ImageConditionedBlockFeats",
         "args": {
             "roots": [
-                "/mnt/data/yizhao/JiTData_Test"
+                "/mnt/data/yizhao/TRAIN"
             ],
-            "max_block_num": 110000,
+            "max_block_num": 13000,
             "min_aesthetic_score": 0.0,
             "max_samples": 0
         }
@@ -39,9 +39,9 @@
         "name": "ImageConditionedBlockFeats",
         "args": {
             "roots": [
-                "/mnt/data/yizhao/TESTDATA"
+                 "/mnt/data/yizhao/TRAIN"
             ],
-            "max_block_num": 110000,
+            "max_block_num": 13000,
             "min_aesthetic_score": 0.0,
             "max_samples": 0
         }
@@ -49,14 +49,15 @@
     "trainer": {
         "name": "ImageConditionedSparseFlowMultiTokenCFGTrainer",
         "args": {
-            "max_steps": 100000,
-            "batch_size_per_gpu": 1,
+            "max_steps": 400000,
+            "batch_size_per_gpu": 2,
             "batch_split": 1,
+            "noise_scale": 2.0,
             "loss_type": "v_loss",
             "lambda_normal": 0.1,
             "surface_weight": 8.0,
-            "complexity_boost": 4.0,
-            "cond_noise_std": 0.01,
+            "complexity_boost": 2.0,
+            "cond_noise_std": 0.0,
             "t_schedule": {
                 "name": "logitNormal",
                 "args": {
@@ -72,16 +73,8 @@
                     "betas": [0.9, 0.95]
                 }
             },
-            "lr_scheduler": {
-                "name": "WarmupCosineLRScheduler",
-                "args": {
-                    "warmup_steps": 5000,
-                    "total_steps": 500000,
-                    "min_lr_ratio": 0.01
-                }
-            },
             "ema_rate": [
-                0.9999
+                0.999
             ],
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
@@ -90,10 +83,11 @@
                     "clip_percentile": 95
                 }
             },
-            "i_log": 100,
+            "i_log": 200,
+            "i_print": 10,
             "num_samples": 16,
-            "i_sample": 5000,
-            "i_save": 10000,
+            "i_sample": 2500,
+            "i_save": 5000,
             "image_cond_model": "dinov2_vitl14_reg"
         }
     }

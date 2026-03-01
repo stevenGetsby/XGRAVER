@@ -10,11 +10,10 @@ from .components import StandardDatasetBase, TextConditionedMixin, ImageConditio
 from ..modules.sparse.basic import SparseTensor
 from ..utils.data_utils import load_balanced_group_indices
 from ..dataset_toolkits.mesh2block import (
-    BLOCK_GRID, BLOCK_INNER, BLOCK_DIM, BLOCK_CORE_VERTS,
-    PADDING, SAMPLE_RES, MC_THRESHOLD,
+    BLOCK_GRID, BLOCK_INNER, BLOCK_DIM,
+    SAMPLE_RES, MC_THRESHOLD,
+    COL_PREFIX, BLOCK_FOLDER, SUBMASK_DIM,
 )
-
-COL_PREFIX = f'{BLOCK_GRID}_{BLOCK_INNER}'
 
 
 class BlockFeats(StandardDatasetBase):
@@ -98,15 +97,26 @@ class BlockFeats(StandardDatasetBase):
         return mesh
 
     def get_instance(self, root, instance):
-        npz_path = os.path.join(root, f'blocks_{COL_PREFIX}', f'{instance}.npz')
+        npz_path = os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')
 
         with np.load(npz_path) as data:
             coords = torch.from_numpy(data['coords']).int()
-            fine_feats = torch.from_numpy(data['fine_feats']).float()
+            raw = data['fine_feats']
+            if raw.dtype == np.float16:
+                fine_feats = torch.from_numpy(raw.astype(np.float32))
+            else:
+                fine_feats = torch.from_numpy(raw).float()
+
+            # per-block sub-mask (兼容旧数据: 没有则全 1)
+            if 'submask' in data.files:
+                submask = torch.from_numpy(data['submask']).float()
+            else:
+                submask = torch.ones(coords.shape[0], SUBMASK_DIM)
 
         return {
             'coords': coords,
             'fine_feats': fine_feats,
+            'submask': submask,
         }
 
     # ------------------------------------------------------------------
@@ -201,16 +211,13 @@ class BlockFeats(StandardDatasetBase):
         F_full = torch.as_tensor(tokens_np, dtype=torch.float32, device=device).reshape(
             n, BLOCK_DIM, BLOCK_DIM, BLOCK_DIM,
         )
-        p = PADDING
-        F_core = F_full[:, p:p+BLOCK_CORE_VERTS,
-                           p:p+BLOCK_CORE_VERTS,
-                           p:p+BLOCK_CORE_VERTS].contiguous()
+        F_core = F_full.contiguous()
 
         # ---- 边界角点平均 (GPU scatter) ----
-        max_dim = BLOCK_GRID * BLOCK_INNER + BLOCK_CORE_VERTS
+        max_dim = BLOCK_GRID * BLOCK_INNER + BLOCK_DIM
         S1, S2 = max_dim * max_dim, max_dim
 
-        ci_arr = torch.arange(BLOCK_CORE_VERTS, device=device)
+        ci_arr = torch.arange(BLOCK_DIM, device=device)
         ci, cj, ck = torch.meshgrid(ci_arr, ci_arr, ci_arr, indexing="ij")
         local_key = (ci * S1 + cj * S2 + ck).reshape(-1)
 
@@ -230,7 +237,7 @@ class BlockFeats(StandardDatasetBase):
         val_cnt.scatter_add_(0, inverse, torch.ones_like(flat_val, dtype=torch.float64))
         val_avg = (val_sum / val_cnt).float()
 
-        F_core = val_avg[inverse].reshape(n, BLOCK_CORE_VERTS, BLOCK_CORE_VERTS, BLOCK_CORE_VERTS)
+        F_core = val_avg[inverse].reshape(n, BLOCK_DIM, BLOCK_DIM, BLOCK_DIM)
         del flat_key, flat_val, val_sum, val_cnt, val_avg, inverse, uniq, F_full
 
         # ---- 提取 8 角点, 筛选有效 voxel (GPU) ----
@@ -362,6 +369,7 @@ class BlockFeats(StandardDatasetBase):
 
             coords_list = []
             fine_list = []
+            submask_list = []
             layout = []
             start = 0
 
@@ -372,17 +380,26 @@ class BlockFeats(StandardDatasetBase):
                     b['coords'],
                 ], dim=-1))
                 fine_list.append(b['fine_feats'])
+                if 'submask' in b:
+                    submask_list.append(b['submask'])
                 layout.append(slice(start, start + n_blocks))
                 start += n_blocks
 
             coords = torch.cat(coords_list, dim=0)
             fine_feats = torch.cat(fine_list, dim=0)
 
-            pack['x_f'] = SparseTensor(coords=coords, feats=fine_feats)
-            pack['x_f']._shape = torch.Size([len(group), fine_feats.shape[1]])
-            pack['x_f'].register_spatial_cache('layout', layout)
+            pack['x_f'] = SparseTensor(
+                coords=coords,
+                feats=fine_feats,
+                shape=torch.Size([len(group), fine_feats.shape[1]]),
+                layout=layout,
+            )
 
-            exclude_keys = {'coords', 'fine_feats'}
+            # per-block sub-mask: [T, 8], 和 feats 同维度对齐
+            if submask_list:
+                pack['submask'] = torch.cat(submask_list, dim=0)
+
+            exclude_keys = {'coords', 'fine_feats', 'submask'}
             other_keys = [k for k in sub_batch[0].keys() if k not in exclude_keys]
 
             for k in other_keys:

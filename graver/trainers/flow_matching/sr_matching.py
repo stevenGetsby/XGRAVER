@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from ...modules import sparse as sp
 from ...pipelines import samplers
 from ...utils.data_utils import cycle, BalancedResumableSampler
-from ...dataset_toolkits.mesh2block import MC_THRESHOLD, BLOCK_DIM
+from ...dataset_toolkits.mesh2block import MC_THRESHOLD, BLOCK_DIM, SUBMASK_RES
 from .flow_matching import FlowMatchingTrainer
 from .mixins.classifier_free_guidance import ClassifierFreeGuidanceMixin
 from .mixins.image_conditioned import ImageConditionedMixin
@@ -27,11 +27,11 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         *args,
         lambda_flow: float = 1.0,
         lambda_normal: float = 0.1,
-        surface_weight: float = 10.0,
+        surface_weight: float = 8.0,
         loss_type: str = "v_loss",
-        complexity_boost: float = 4.0,
+        complexity_boost: float = 2.0,
         cond_noise_std: float = 0.0,
-        noise_scale: float = 1.0,
+        noise_scale: float = 2.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -61,7 +61,8 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             batch_size=self.batch_size_per_gpu,
         )
         num_gpus = max(torch.cuda.device_count(), 1)
-        num_workers = min(4, max(1, os.cpu_count() // num_gpus))
+        cores_per_gpu = os.cpu_count() // num_gpus
+        num_workers = max(1, min(cores_per_gpu, 16))
 
         self.dataloader = DataLoader(
             self.dataset,
@@ -70,42 +71,69 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             pin_memory=True,
             drop_last=True,
             persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
             collate_fn=functools.partial(
                 self.dataset.collate_fn, split_size=self.batch_split,
             ),
             sampler=self.data_sampler,
         )
         self.data_iterator = cycle(self.dataloader)
-        print(f"[DataLoader] num_workers={num_workers}, "
+        print(f"[DataLoader] num_workers={num_workers} "
+              f"(cores_per_gpu={cores_per_gpu}), "
               f"batch_size={self.batch_size_per_gpu}")
 
     # ------------------------------------------------------------------
     # SparseTensor diffuse / v-prediction
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _expand_t_to_tokens(t: torch.Tensor, layout, T: int) -> torch.Tensor:
+        """将 batch-level t [B] 展开为 token-level [T, 1]，纯向量化无 Python 循环。"""
+        counts = torch.tensor(
+            [sl.stop - sl.start for sl in layout],
+            device=t.device, dtype=torch.long,
+        )
+        return t.repeat_interleave(counts).unsqueeze(1)
+
     def diffuse(self, x_0, t, noise=None):
         if isinstance(x_0, sp.SparseTensor):
             if noise is None:
                 noise = x_0.replace(torch.randn_like(x_0.feats))
-            t_expand = t.view(-1, 1)
-            T = x_0.feats.shape[0]
-            t_per_token = torch.zeros(T, 1, device=x_0.device)
-            for i, sl in enumerate(x_0.layout):
-                t_per_token[sl] = t_expand[i]
+            t_per_token = self._expand_t_to_tokens(t, x_0.layout, x_0.feats.shape[0])
             x_t_feats = t_per_token * x_0.feats + (1 - t_per_token) * noise.feats
             return x_0.replace(x_t_feats)
         return super().diffuse(x_0, t, noise=noise)
 
     def compute_v_from_x_prediction(self, x_t, x_pred, t):
         if isinstance(x_t, sp.SparseTensor):
-            T = x_t.feats.shape[0]
-            t_per_token = torch.zeros(T, 1, device=x_t.device)
-            for i, sl in enumerate(x_t.layout):
-                t_per_token[sl] = t[i]
+            t_per_token = self._expand_t_to_tokens(t, x_t.layout, x_t.feats.shape[0])
             denom = (1 - t_per_token).clamp(min=0.05)
             v_feats = (x_pred.feats - x_t.feats) / denom
             return x_t.replace(v_feats)
         return super().compute_v_from_x_prediction(x_t, x_pred, t)
+
+    # ------------------------------------------------------------------
+    # Selective masking: submask [T, 8] → per-voxel mask [T, 4096]
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    @torch.no_grad()
+    def _upsample_submask(submask: torch.Tensor, block_dim: int = BLOCK_DIM) -> torch.Tensor:
+        """将 per-block SUBMASK_RES³ submask 上采样到 per-voxel BLOCK_DIM³ mask.
+        
+        Args:
+            submask: [T, SUBMASK_DIM] float (0/1)
+            block_dim: BLOCK_DIM
+            
+        Returns:
+            voxel_mask: [T, block_dim³] float (0/1)
+        """
+        R = SUBMASK_RES
+        T = submask.shape[0]
+        sub_3d = submask.reshape(T, 1, R, R, R)
+        scale = block_dim // R
+        voxel_3d = F.interpolate(sub_3d, scale_factor=scale, mode='nearest')
+        return voxel_3d.reshape(T, -1)
 
     # ------------------------------------------------------------------
     # Normal loss (UDF 梯度方向一致性)
@@ -201,9 +229,12 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             var_gn = ((grad_norm - mean_gn.unsqueeze(1)).pow(2) * w).sum(dim=1) / w_sum
             block_curvature[surface_mask] = var_gn.sqrt()
 
-        # 2. 邻域曲率梯度: 6-连通邻居间曲率差异
+        # 2. 邻域曲率梯度: 6-连通邻居间曲率差异 (纯 GPU 向量化)
         complexity = torch.zeros(T, device=device)
-        offsets = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+        offsets = torch.tensor(
+            [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
+            device=device, dtype=torch.long,
+        )  # [6, 3]
 
         for b, sl in enumerate(layout):
             bc = coords[sl][:, 1:].long()  # [N_b, 3]
@@ -214,32 +245,43 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                 complexity[sl] = curv
                 continue
 
-            # Hash → index (向量化邻居查找)
-            keys_t = bc[:, 0] * 100003 + bc[:, 1] * 1009 + bc[:, 2]
-            key_to_idx = {k: i for i, k in enumerate(keys_t.tolist())}
+            # GPU hash: 所有 block 坐标 → 唯一 key
+            P1, P2 = 100003, 1009
+            keys = bc[:, 0] * P1 + bc[:, 1] * P2 + bc[:, 2]  # [N_b]
 
-            curv_diff_sum = torch.zeros(N_b, device=device)
-            n_surf_nb = torch.zeros(N_b, device=device)
+            # 6 个方向的邻居 key: [N_b, 6]
+            nb_coords = bc.unsqueeze(1) + offsets.unsqueeze(0)  # [N_b, 6, 3]
+            nb_keys = (nb_coords[:, :, 0] * P1
+                       + nb_coords[:, :, 1] * P2
+                       + nb_coords[:, :, 2])  # [N_b, 6]
 
-            for dx, dy, dz in offsets:
-                nb_keys = ((bc[:, 0] + dx) * 100003
-                           + (bc[:, 1] + dy) * 1009
-                           + (bc[:, 2] + dz))
-                nb_idx = torch.tensor(
-                    [key_to_idx.get(k, -1) for k in nb_keys.tolist()],
-                    device=device, dtype=torch.long,
-                )
-                valid = nb_idx >= 0
-                safe_idx = nb_idx.clamp(min=0)
-                valid_surf = valid & is_surf[safe_idx]
+            # GPU hash table lookup via sorting
+            # 合并所有 key, 用 searchsorted 做向量化查找
+            sorted_keys, sort_idx = keys.sort()
+            # 在排序后的 keys 中查找邻居
+            flat_nb = nb_keys.reshape(-1)  # [N_b * 6]
+            pos = torch.searchsorted(sorted_keys, flat_nb)
+            pos = pos.clamp(max=N_b - 1)
+            # 验证是否真的匹配
+            matched = sorted_keys[pos] == flat_nb
+            # 映射回原始 index
+            nb_idx_flat = sort_idx[pos]  # 原始空间中的 index
+            nb_idx_flat[~matched] = 0    # 无效位置用 0 (安全索引)
 
-                nb_curv = curv[safe_idx]
-                curv_diff_sum += (curv - nb_curv).abs() * valid_surf.float()
-                n_surf_nb += valid_surf.float()
+            nb_idx = nb_idx_flat.reshape(N_b, 6)     # [N_b, 6]
+            valid = matched.reshape(N_b, 6)           # [N_b, 6]
+
+            # 邻居曲率 + 表面判断
+            nb_curv = curv[nb_idx]                    # [N_b, 6]
+            nb_is_surf = is_surf[nb_idx]              # [N_b, 6]
+            valid_surf = valid & nb_is_surf           # [N_b, 6]
+
+            curv_diff = (curv.unsqueeze(1) - nb_curv).abs() * valid_surf.float()
+            n_surf_nb = valid_surf.float().sum(dim=1)  # [N_b]
 
             has_nb = n_surf_nb > 0
             mean_diff = torch.where(
-                has_nb, curv_diff_sum / n_surf_nb,
+                has_nb, curv_diff.sum(dim=1) / n_surf_nb,
                 torch.zeros_like(n_surf_nb),
             )
 
@@ -265,6 +307,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         x_f: sp.SparseTensor = None,
         x_c: sp.SparseTensor = None,
         cond=None,
+        submask=None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
         x = x_f if x_f is not None else x_c
@@ -291,40 +334,60 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             _t_cond = time.time() - _t0
 
         with torch.no_grad():
-            noise = x.replace(
-                self.noise_scale * torch.randn_like(x.feats)
-            )
+            noise_raw = self.noise_scale * torch.randn_like(x.feats)
+
+            # Selective masking: submask=0 的位置不加噪, 确定性填 1.0
+            if submask is not None:
+                submask = submask.to(device)
+                voxel_mask = self._upsample_submask(submask)  # [T, 4096]
+                # mask=0 的位置: noise=0, GT 强制=1.0
+                noise_raw = noise_raw * voxel_mask
+                # 强制 GT 远场区域为 1.0 (和 mask 一致)
+                x_feats_masked = x.feats * voxel_mask + (1.0 - voxel_mask) * 1.0
+                x_masked = x.replace(x_feats_masked)
+            else:
+                voxel_mask = None
+                x_masked = x
+
+            noise = x.replace(noise_raw)
             t = self.sample_t(B).to(device).float()
-            x_t = self.diffuse(x, t, noise=noise)
+            x_t = self.diffuse(x_masked, t, noise=noise)
+
+            # mask=0 的位置: x_t 强制 = 1.0 (确保模型看到的远场是确定性的)
+            if voxel_mask is not None:
+                x_t_feats = x_t.feats * voxel_mask + (1.0 - voxel_mask) * 1.0
+                x_t = x_t.replace(x_t_feats)
 
         if _profile:
             torch.cuda.synchronize()
             _t_prep = time.time() - _t0 - _t_cond
 
-        pred = self.training_models["denoiser"](x_t, t, cond)
+        pred = self.training_models["denoiser"](x_t, t, cond, submask=submask)
 
         if _profile:
             torch.cuda.synchronize()
             _t_fwd = time.time() - _t0 - _t_cond - _t_prep
 
         # 模型直接在原始 UDF [0,1] 空间预测 x_0
-        x_residual = pred.feats - x.feats
+        x_residual = pred.feats - x_masked.feats
         v = self.voxel
 
-        t_per_token = torch.zeros(T, 1, device=device)
-        for i, sl in enumerate(x.layout):
-            t_per_token[sl] = t[i]
+        t_per_token = self._expand_t_to_tokens(t, x.layout, T)
 
         if self.loss_type == "v_loss":
             v_denom = (1 - t_per_token).clamp(min=0.05)
             v_residual = x_residual / v_denom
-            diff = v_residual ** 2 + 0.2 * v_residual.abs()
+            diff = v_residual ** 2
         else:
-            diff = x_residual ** 2 + 0.2 * x_residual.abs()
+            diff = x_residual ** 2
+
+        # Selective masking: mask=0 的位置不参与 loss
+        if voxel_mask is not None:
+            diff = diff * voxel_mask
 
         with torch.no_grad():
-            mc_mask   = x.feats < v * 2
-            far_mask  = x.feats > v * 3
+            mc_mask   = x_masked.feats < v * 2
+            far_mask  = x_masked.feats > v * 3
             near_mask = ~mc_mask & ~far_mask
 
         mc_f   = mc_mask.float()
@@ -332,7 +395,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         far_f  = far_mask.float()
 
         block_loss_mc = (diff * mc_f).sum(dim=1) / mc_f.sum(dim=1).clamp(min=1)
-
         block_loss_near = (diff * near_f).sum(dim=1) / near_f.sum(dim=1).clamp(min=1)
         block_loss_far  = (diff * far_f).sum(dim=1) / far_f.sum(dim=1).clamp(min=1)
 
@@ -345,24 +407,43 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         # Complexity reweighting: 连通 block 曲率变化越陡峭 → 权重越大
         with torch.no_grad():
             complexity_w = self._neighborhood_complexity(
-                x.feats, x.coords, x.layout,
+                x_masked.feats, x.coords, x.layout,
                 self.voxel, self.complexity_boost,
             )
 
         block_loss = block_loss * complexity_w
-        terms["flow_loss"] = block_loss.mean()
+
+        # Per-sample 归一化: 每个样本贡献等权, 避免大 token 数样本主导梯度
+        per_sample_loss = torch.stack([
+            block_loss[sl].mean() for sl in x.layout
+        ])
+        terms["flow_loss"] = per_sample_loss.mean()
         terms["complexity_avg"] = complexity_w.mean()
 
-        terms["loss_mc"]   = block_loss_mc.mean()
-        terms["loss_near"] = block_loss_near.mean()
-        terms["loss_far"]  = block_loss_far.mean()
+        per_sample_mc   = torch.stack([block_loss_mc[sl].mean() for sl in x.layout])
+        per_sample_near = torch.stack([block_loss_near[sl].mean() for sl in x.layout])
+        per_sample_far  = torch.stack([block_loss_far[sl].mean() for sl in x.layout])
+        terms["loss_mc"]   = per_sample_mc.mean()
+        terms["loss_near"] = per_sample_near.mean()
+        terms["loss_far"]  = per_sample_far.mean()
 
         terms["loss"] = self.lambda_flow * terms["flow_loss"]
 
-        # Normal Loss
+        # Normal Loss (default off; 建议 flow_loss 收敛后再开)
         if self.lambda_normal > 0:
-            terms["normal_loss"] = self._normal_loss(pred.feats, x.feats)
+            terms["normal_loss"] = self._normal_loss(pred.feats, x_masked.feats)
             terms["loss"] = terms["loss"] + self.lambda_normal * terms["normal_loss"]
+
+        # 按 t 分桶监控: 诊断哪个时间区间卡住
+        with torch.no_grad():
+            # block_loss 是 per-token [T], 先聚合为 per-batch [B]
+            batch_loss = torch.stack([
+                block_loss[sl].mean() for sl in x.layout
+            ])
+            for lo, hi in [(0.0, 0.3), (0.3, 0.7), (0.7, 1.0)]:
+                mask = (t >= lo) & (t < hi)
+                if mask.any():
+                    terms[f"loss_t{lo:.1f}_{hi:.1f}"] = batch_loss[mask].mean()
 
         if _profile:
             torch.cuda.synchronize()
@@ -453,8 +534,9 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         self,
         num_samples: int = 4,
         batch_size: int = 1,
-        steps: int = 50,
+        steps: int = 100,
         cfg_strength: float = 1.5,
+        cfg_interval: Tuple[float, float] = (0.1, 1.0),
         **kwargs,
     ):
         verbose = True
@@ -528,20 +610,43 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                 x_c = data.pop("x_c", None)
                 x_f = data.pop("x_f", None)
                 data.pop("n_f", None)
+                snap_submask = data.pop("submask", None)
                 x_gt = x_f if x_f is not None else x_c
 
-                noise = x_gt.replace(
-                    self.noise_scale * torch.randn_like(x_gt.feats)
-                )
+                noise_raw = self.noise_scale * torch.randn_like(x_gt.feats)
+
+                # Selective masking: mask=0 位置不加噪, 初始值 = 1.0
+                if snap_submask is not None:
+                    snap_submask = snap_submask.cuda()
+                    snap_voxel_mask = self._upsample_submask(snap_submask)
+                    noise_raw = noise_raw * snap_voxel_mask
+                    # 初始噪声中 mask=0 → 1.0
+                    noise_raw = noise_raw + (1.0 - snap_voxel_mask) * 1.0
+                    noise = x_gt.replace(noise_raw)
+                else:
+                    snap_voxel_mask = None
+                    noise = x_gt.replace(noise_raw)
+
                 args = self.get_inference_cond(**data)
+                # 把 submask 传给模型, voxel_mask 传给 sampler
+                if snap_submask is not None:
+                    args['submask'] = snap_submask
+                    args['voxel_mask'] = snap_voxel_mask
 
                 with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                     res = sampler.sample(
                         model, noise=noise, **args,
                         steps=steps, cfg_strength=cfg_strength,
+                        cfg_interval=cfg_interval,
+                        use_heun=True,
                         verbose=False,
                     )
                     pred = res.samples
+
+                # 推理后 mask=0 位置强制 = 1.0
+                if snap_voxel_mask is not None:
+                    pred_feats = pred.feats * snap_voxel_mask + (1.0 - snap_voxel_mask) * 1.0
+                    pred = pred.replace(pred_feats)
 
                 actual_batch = len(x_gt.layout)
                 for b in range(min(actual_batch, my_count - saved)):

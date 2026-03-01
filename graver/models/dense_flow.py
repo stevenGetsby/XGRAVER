@@ -62,6 +62,7 @@ class DenseFlowModel(nn.Module):
         model_channels: int,
         cond_channels: int,
         num_blocks: int,
+        bottleneck_dim: int = 128,
         num_heads: Optional[int] = None,
         num_head_channels: Optional[int] = 64,
         mlp_ratio: float = 4,
@@ -75,7 +76,7 @@ class DenseFlowModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        resolution = BLOCK_GRID
+        resolution = BLOCK_GRID  # 64³ block occupancy
         in_channels = 1
         out_channels = 1
 
@@ -112,7 +113,7 @@ class DenseFlowModel(nn.Module):
             ), dim=-1).reshape(-1, 3) # [L, 3]
             self.register_buffer("grid_coords", coords, persistent=False)
 
-        bottleneck_dim = model_channels // 4 
+        bottleneck_dim = bottleneck_dim
         self.input_layer = nn.Sequential(
             nn.Linear(in_channels * patch_size**3, bottleneck_dim),
             nn.LayerNorm(bottleneck_dim), 
@@ -142,9 +143,11 @@ class DenseFlowModel(nn.Module):
 
         grid_size = resolution // patch_size
         n_tokens = grid_size ** 3
+        patch_dim = in_channels * patch_size**3
         n_params = sum(p.numel() for p in self.parameters()) / 1e6
         print(f"[DenseFlowModel] BLOCK_GRID={resolution}, patch={patch_size}, "
-              f"tokens={n_tokens}, ch={in_channels}->{model_channels}x{num_blocks}->{out_channels}, "
+              f"tokens={n_tokens}, patch_dim={patch_dim}, bottleneck={bottleneck_dim}, "
+              f"ch={in_channels}->{model_channels}x{num_blocks}->{out_channels}, "
               f"attn=full, heads={self.num_heads}, fp16={use_fp16}, params={n_params:.1f}M")
 
     @property

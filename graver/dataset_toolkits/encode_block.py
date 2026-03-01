@@ -7,9 +7,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 
-from mesh2block import generate_adaptive_udf, BLOCK_GRID, BLOCK_INNER
-
-COL_PREFIX = f'{BLOCK_GRID}_{BLOCK_INNER}'
+from mesh2block import generate_adaptive_udf, BLOCK_GRID, BLOCK_INNER, COL_PREFIX, BLOCK_FOLDER
 
 worker_device = None
 
@@ -40,7 +38,7 @@ def process_one(sha256: str, root: str) -> dict:
     """处理单个 mesh，生成 block 数据，同时累积 UDF 归一化统计量."""
     
     input_path = os.path.join(root, 'renders_cond', sha256, 'mesh.ply')
-    output_npz_path = os.path.join(root, f'blocks_{COL_PREFIX}', f'{sha256}.npz')
+    output_npz_path = os.path.join(root, BLOCK_FOLDER, f'{sha256}.npz')
     
     result = {
         'sha256': sha256,
@@ -100,7 +98,7 @@ if __name__ == '__main__':
     opt = parser.parse_args()
     
     # 创建输出目录
-    output_dir = os.path.join(opt.root, f'blocks_{COL_PREFIX}')
+    output_dir = os.path.join(opt.root, BLOCK_FOLDER)
     os.makedirs(output_dir, exist_ok=True)
     
     # 1. 读取 Metadata
@@ -136,21 +134,46 @@ if __name__ == '__main__':
     
     use_cuda = opt.device.startswith('cuda')
     records = []
-    tasks = [(row['sha256'], opt.root) for _, row in metadata.iterrows()]
+    all_tasks = [(row['sha256'], opt.root) for _, row in metadata.iterrows()]
+    
+    # 预过滤: 跳过已完成的任务, 大幅减少实际工作量
+    tasks = []
+    skipped = 0
+    for sha256, root in all_tasks:
+        output_npz_path = os.path.join(root, BLOCK_FOLDER, f'{sha256}.npz')
+        if os.path.exists(output_npz_path):
+            try:
+                with np.load(output_npz_path) as data:
+                    if {'coords', 'fine_feats'}.issubset(data.files):
+                        num_blocks = len(data['coords'])
+                        records.append({
+                            'sha256': sha256,
+                            f'{COL_PREFIX}_num_blocks': num_blocks,
+                            f'{COL_PREFIX}_block_status': 'success',
+                        })
+                        skipped += 1
+                        continue
+            except Exception:
+                pass
+        tasks.append((sha256, root))
+    
+    print(f"Pre-filter: {skipped} already done, {len(tasks)} to process")
     
     if use_cuda:
         # ============================================================
-        # GPU 模式: 每张卡一个进程，CUDA_VISIBLE_DEVICES 隔离
+        # GPU 模式: 每张卡多个进程, 重叠 I/O 和 GPU 计算
         # ============================================================
         num_gpus = torch.cuda.device_count()
         if num_gpus == 0:
             print("WARNING: --device=cuda but no GPU detected. Falling back to CPU.")
             use_cuda = False
         else:
-            effective_workers = min(opt.max_workers, num_gpus)
-            print(f"Detected {num_gpus} GPUs. Launching {effective_workers} workers (1 per GPU).")
+            workers_per_gpu = 1
+            effective_workers = num_gpus * workers_per_gpu
+            print(f"Detected {num_gpus} GPUs. Launching {effective_workers} workers "
+                  f"({workers_per_gpu} per GPU).")
             
-            # 为每个 worker 分配 GPU ID
+            # 为每个 worker 分配 GPU ID (轮询分配)
             manager = multiprocessing.Manager()
             gpu_queue = manager.Queue()
             for i in range(effective_workers):

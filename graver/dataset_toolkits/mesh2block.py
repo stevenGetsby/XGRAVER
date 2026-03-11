@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+from typing import Tuple
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -18,13 +19,13 @@ VOXEL_SIZE = 1.0 / SAMPLE_RES
 UDF_TRUNC_VOXELS = 5                            # 截断体素数
 TRUNCATION = UDF_TRUNC_VOXELS * VOXEL_SIZE      # 5/896 ≈ 0.00558
 MC_THRESHOLD = 1.0 / UDF_TRUNC_VOXELS           # 1/5 = 0.2 (1 voxel in UDF space)
-SURFACE_THRESHOLD = 2 * MC_THRESHOLD            # 2/5 = 0.4
+SURFACE_THRESHOLD = 2 * MC_THRESHOLD            # 2/5 = 0.4 (MC 插值带精确覆盖)
 
 # GPU BVH 面数上限
 MAX_FACES_FOR_BVH = 1000_000
 
 # Per-block sub-mask: 从 UDF 直接提取, 标记 MC 表面穿越的子区域
-SUBMASK_RES = 8                                 # sub-mask 每轴分辨率 (可调, 需整除 BLOCK_DIM)
+SUBMASK_RES = 4                                 # sub-mask 每轴分辨率 (occ4, 需整除 BLOCK_DIM)
 SUBMASK_STRIDE = BLOCK_DIM // SUBMASK_RES       # 每个 sub-cell 覆盖的 UDF 体素数
 SUBMASK_DIM = SUBMASK_RES ** 3                  # per-block mask 展平维度
 
@@ -39,28 +40,23 @@ BLOCK_FOLDER = f'blocks_{COL_PREFIX}'
 
 def extract_submask_from_udf(udf: np.ndarray) -> np.ndarray:
     """
-    从 per-block UDF 直接计算 binary sub-mask.
+    从 per-block UDF 提取 binary sub-mask (occ4, 不膨胀).
     
-    将每个 block 的 BLOCK_DIM³ UDF 划分为 SUBMASK_RES³ 个子区域,
-    每个子区域覆盖 SUBMASK_STRIDE³ 个 UDF 体素.
-    若子区域内任何体素的 UDF < SURFACE_THRESHOLD, 则标记为 1 (MC 表面穿越).
+    每个 block 的 BLOCK_DIM³ UDF 划分为 SUBMASK_RES³ 子区域,
+    子区域内任意 UDF < SURFACE_THRESHOLD → 标记为 1.
+    
+    注意: 不再做运行时膨胀, Stage 3 直接使用该紧凑 mask.
     
     Args:
         udf: [N, BLOCK_DIM³] float, 归一化 UDF ∈ [0, 1]
-        
     Returns:
         submask: [N, SUBMASK_DIM] float32, binary (0/1)
     """
     N = len(udf)
-    D = BLOCK_DIM
-    R = SUBMASK_RES
-    S = SUBMASK_STRIDE
-    
-    # [N, D, D, D] → [N, R, S, R, S, R, S] → min over stride axes
+    R, S = SUBMASK_RES, SUBMASK_STRIDE
     vol = udf.reshape(N, R, S, R, S, R, S)
-    sub_min = vol.min(axis=(2, 4, 6))  # [N, R, R, R]
+    sub_min = vol.min(axis=(2, 4, 6))                           # [N, R, R, R]
     submask = (sub_min < SURFACE_THRESHOLD).astype(np.float32)
-    
     return submask.reshape(N, -1)
 
 
@@ -507,10 +503,10 @@ def generate_adaptive_udf(input_path: str, output_npz_path: str,
     coords_s = coords[has_surface]
     udf_s = udf[has_surface]
 
-    # 从 UDF 直接提取 sub-mask
+    # 从 UDF 提取 sub-mask (带膨胀)
     submask_s = extract_submask_from_udf(udf_s)
 
-    # 3. 保存: float16 + gzip 压缩
+    # 3. 保存
     os.makedirs(os.path.dirname(output_npz_path), exist_ok=True)
     np.savez_compressed(
         output_npz_path,

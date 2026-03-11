@@ -1,4 +1,5 @@
 from typing import *
+import os
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
@@ -34,8 +35,12 @@ class ImageConditionedMixin:
         """
         Initialize the image conditioning model.
         """
+        dinov2_local = os.path.join(os.path.expanduser('~'), '.cache', 'torch', 'hub', 'facebookresearch_dinov2_main')
         with dist_utils.local_master_first():
-            dinov2_model = torch.hub.load('/home/ubuntu/.cache/torch/hub/facebookresearch_dinov2_main', self.image_cond_model_name, source='local', pretrained=True)
+            if os.path.isdir(dinov2_local):
+                dinov2_model = torch.hub.load(dinov2_local, self.image_cond_model_name, source='local', pretrained=True)
+            else:
+                dinov2_model = torch.hub.load('facebookresearch/dinov2', self.image_cond_model_name, pretrained=True)
         dinov2_model.eval().cuda()
         transform = transforms.Compose([
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),

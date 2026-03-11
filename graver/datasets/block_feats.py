@@ -33,6 +33,10 @@ class BlockFeats(StandardDatasetBase):
         self.max_samples = max_samples
 
         super().__init__(roots)
+        self.filter_existing_instances(
+            lambda root, instance: os.path.exists(os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')),
+            stat_name='npz exists',
+        )
 
         if self.max_samples > 0 and len(self.instances) > self.max_samples:
             self.instances = self.instances[:self.max_samples]
@@ -109,7 +113,7 @@ class BlockFeats(StandardDatasetBase):
 
             # per-block sub-mask (兼容旧数据: 没有则全 1)
             if 'submask' in data.files:
-                submask = torch.from_numpy(data['submask']).float()
+                submask = torch.from_numpy(data['submask'].astype(np.float32))
             else:
                 submask = torch.ones(coords.shape[0], SUBMASK_DIM)
 

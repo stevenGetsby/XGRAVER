@@ -15,11 +15,11 @@ from .dense_flow import TimestepEmbedder
 
 class SparseFlowModel(nn.Module):
     """
-    Unified sparse flow transformer for Stage 2 (sub-mask) and Stage 3 (UDF).
+    Sparse flow transformer for Stage 3 (UDF refinement).
     
-    Config via resolution:
-      Stage 2: resolution=SUBMASK_RES (8), bottleneck_dim=0, submask_resolution=0
-      Stage 3: resolution=BLOCK_DIM (16), bottleneck_dim=128, submask_resolution=SUBMASK_RES (8)
+        Config via resolution:
+            Stage 2: resolution=SUBMASK_RES (4), bottleneck_dim=0, submask_resolution=0
+            Stage 3: resolution=BLOCK_DIM (16), bottleneck_dim=128, submask_resolution=SUBMASK_RES (4)
     """
 
     # 6-面邻域偏移

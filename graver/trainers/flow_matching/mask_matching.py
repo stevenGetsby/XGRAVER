@@ -1,39 +1,40 @@
 """
-Stage 2 trainer: sparse flow matching for per-block binary sub-mask.
+Stage 2 trainer: sparse flow matching on per-block submask [0,1].
 
-Simple x-prediction + v-loss on SUBMASK_DIM binary targets.
-No surface weighting, no normal loss — just clean flow matching.
+Standard continuous flow matching (v-loss) on submask values.
+No Bit Diffusion, no backbone head — clean independent sparse model.
 """
 from typing import *
 import os
-import math
 import copy
 import functools
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import utils3d
+import torch.distributed as dist
 from easydict import EasyDict as edict
 from torch.utils.data import DataLoader
 
 from ...modules import sparse as sp
 from ...pipelines import samplers
 from ...utils.data_utils import cycle, BalancedResumableSampler
-from ...representations.octree import DfsOctree as Octree
-from ...renderers import OctreeRenderer
-from ...dataset_toolkits.mesh2block import BLOCK_GRID, SUBMASK_RES
 from .flow_matching import FlowMatchingTrainer
 from .mixins.classifier_free_guidance import ClassifierFreeGuidanceMixin
 from .mixins.image_conditioned import ImageConditionedMixin
 
 
 class SparseMaskFlowTrainer(FlowMatchingTrainer):
-    """Flow matching trainer for per-block binary sub-mask prediction."""
+    """
+    Sparse flow matching trainer for per-block submask prediction.
+    Submask ∈ [0,1]^64, treated as continuous targets with standard v-loss.
+    """
 
-    def __init__(self, *args, noise_scale: float = 1.0, **kwargs):
+    def __init__(self, *args, recall_weight: float = 3.0, **kwargs):
         super().__init__(*args, **kwargs)
-        self.noise_scale = noise_scale
+        self.recall_weight = recall_weight
+        print(f"[SparseMaskFlowTrainer] recall_weight={recall_weight}, "
+              f"noise_scale={self.noise_scale}")
 
     # ------------------------------------------------------------------
     # Dataloader (sparse, balanced)
@@ -89,7 +90,7 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
         return super().compute_v_from_x_prediction(x_t, x_pred, t)
 
     # ------------------------------------------------------------------
-    # Training losses
+    # Training losses — standard v-loss with recall weighting
     # ------------------------------------------------------------------
 
     def training_losses(self, x_0=None, cond=None, **kwargs) -> Tuple[Dict, Dict]:
@@ -98,6 +99,7 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
         device = x_0.device
 
         cond = self.get_cond(cond, **kwargs)
+
         noise_raw = self.noise_scale * torch.randn_like(x_0.feats)
         noise = x_0.replace(noise_raw)
         t = self.sample_t(B).to(device).float()
@@ -105,13 +107,29 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
 
         pred = self.training_models['denoiser'](x_t, t, cond)
 
-        # v-loss (x-prediction parameterization)
+        # Standard v-loss
         v_target = self.compute_v_from_x_prediction(x_t, x_0, t)
         v_pred = self.compute_v_from_x_prediction(x_t, pred, t)
 
+        # Recall-biased weighting: surface cells (GT=1) get higher weight
+        with torch.no_grad():
+            w = 1.0 + (self.recall_weight - 1.0) * x_0.feats  # [T, 64]
+
+        mse = (w * (v_pred.feats - v_target.feats) ** 2).mean()
+
+        # Inline IoU for monitoring (threshold at 0.5)
+        with torch.no_grad():
+            pred_bin = (pred.feats > 0.5).float()
+            gt_bin = (x_0.feats > 0.5).float()
+            tp = (pred_bin * gt_bin).sum()
+            fp = (pred_bin * (1 - gt_bin)).sum()
+            fn = ((1 - pred_bin) * gt_bin).sum()
+            train_iou = (tp / (tp + fp + fn).clamp(min=1)).item()
+
         terms = edict()
-        terms["mse"] = F.mse_loss(v_pred.feats, v_target.feats)
-        terms["loss"] = terms["mse"]
+        terms["mse"] = mse
+        terms["loss"] = mse
+        terms["train_iou"] = train_iou
 
         # Per-bin logging
         t_np = t.cpu().numpy()
@@ -127,119 +145,75 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
         return terms, {}
 
     # ------------------------------------------------------------------
-    # Snapshot: submask → 全局体素 → OctreeRenderer 4 视角渲染
+    # Snapshot
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _submask_to_voxel_coords(block_coords: torch.Tensor,
-                                  submask: torch.Tensor,
-                                  threshold: float = 0.5) -> torch.Tensor:
-        """
-        将 per-block submask 展开为全局体素坐标.
-        
-        block_coords: [N, 4] (batch_idx, bx, by, bz) int
-        submask: [N, SUBMASK_DIM] float
-        返回: [M, 3] 全局体素坐标 (在 BLOCK_GRID*SUBMASK_RES 空间中)
-        """
-        R = SUBMASK_RES
-        # 构造每个 sub-cell 的局部偏移 [R³, 3]
-        ri = torch.arange(R, device=submask.device)
-        rx, ry, rz = torch.meshgrid(ri, ri, ri, indexing='ij')
-        local = torch.stack([rx, ry, rz], dim=-1).reshape(-1, 3)  # [R³, 3]
+    @torch.no_grad()
+    def snapshot(self, suffix=None, num_samples=4, batch_size=1, verbose=False):
+        if suffix is None:
+            suffix = f'step{self.step:07d}'
 
-        # submask 二值化
-        active = submask > threshold  # [N, R³]
+        n_per_rank = max(1, int(np.ceil(num_samples / self.world_size)))
+        local_counts = self._run_snapshot_counts(n_per_rank, batch_size, verbose)
 
-        # 每个 block 的全局基坐标 (去掉 batch_idx 列)
-        base = block_coords[:, 1:4].long() * R  # [N, 3]
+        # All-reduce
+        keys = ['tp', 'fp', 'fn', 'sum_gt', 'sum_pred', 'total']
+        tensors = {k: torch.tensor(local_counts[k], device='cuda') for k in keys}
+        if self.world_size > 1:
+            for v in tensors.values():
+                dist.all_reduce(v, op=dist.ReduceOp.SUM)
+        counts = {k: v.item() for k, v in tensors.items()}
 
-        # 展开: global = base + local_offset
-        global_coords = base[:, None, :] + local[None, :, :]  # [N, R³, 3]
-        return global_coords[active]  # [M, 3]
+        tp, fp, fn = counts['tp'], counts['fp'], counts['fn']
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        iou = tp / max(tp + fp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
 
-    @staticmethod
-    def _render_voxels(coords: torch.Tensor, resolution: int) -> torch.Tensor:
-        """
-        用 OctreeRenderer 渲染体素到 4 视角 1024×1024 拼图.
-        coords: [M, 3] 全局体素坐标
-        返回: [3, 1024, 1024] RGB image tensor
-        """
-        renderer = OctreeRenderer()
-        renderer.rendering_options.resolution = 512
-        renderer.rendering_options.near = 0.8
-        renderer.rendering_options.far = 1.6
-        renderer.rendering_options.bg_color = (0, 0, 0)
-        renderer.rendering_options.ssaa = 4
-        renderer.pipe.primitive = 'voxel'
+        metrics = {
+            'iou': iou,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'pos_gt': counts['sum_gt'] / max(counts['total'], 1),
+            'pos_pred': counts['sum_pred'] / max(counts['total'], 1),
+        }
 
-        yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
-        yaw_off = np.random.uniform(-np.pi / 4, np.pi / 4)
-        yaws = [y + yaw_off for y in yaws]
-        pitches = [np.random.uniform(-np.pi / 4, np.pi / 4) for _ in range(4)]
-
-        exts, ints = [], []
-        for yaw, p in zip(yaws, pitches):
-            orig = torch.tensor([
-                np.sin(yaw) * np.cos(p),
-                np.cos(yaw) * np.cos(p),
-                np.sin(p),
-            ]).float().cuda() * 2
-            fov = torch.deg2rad(torch.tensor(30.0)).cuda()
-            ext = utils3d.torch.extrinsics_look_at(
-                orig, torch.zeros(3).float().cuda(),
-                torch.tensor([0, 0, 1]).float().cuda())
-            intr = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
-            exts.append(ext)
-            ints.append(intr)
-
-        representation = Octree(
-            depth=10,
-            aabb=[-0.5, -0.5, -0.5, 1, 1, 1],
-            device='cuda',
-            primitive='voxel',
-            sh_degree=0,
-            primitive_config={'solid': True},
-        )
-        # 归一化坐标到 [-0.5, 0.5]
-        positions = coords.float() / resolution
-        representation.position = positions
-        representation.depth = torch.full(
-            (positions.shape[0], 1),
-            int(math.log2(resolution)),
-            dtype=torch.uint8, device='cuda',
-        )
-
-        image = torch.zeros(3, 1024, 1024, device='cuda')
-        for j, (ext, intr) in enumerate(zip(exts, ints)):
-            res = renderer.render(representation, ext, intr,
-                                  colors_overwrite=positions)
-            r, c = j // 2, j % 2
-            image[:, r * 512:(r + 1) * 512, c * 512:(c + 1) * 512] = res['color']
-        return image
+        if self.is_master:
+            out_dir = os.path.join(self.output_dir, 'samples', suffix)
+            os.makedirs(out_dir, exist_ok=True)
+            print(f'\n[Snapshot] {num_samples} samples:')
+            with open(os.path.join(out_dir, 'metrics.txt'), 'w') as f:
+                for k, v in metrics.items():
+                    line = f'{k}: {v:.4f}'
+                    print(f'  {line}')
+                    f.write(line + '\n')
+            print('  Done.')
 
     @torch.no_grad()
-    def run_snapshot(self, num_samples: int, batch_size: int, verbose=False):
-        """
-        采样 submask → 展开为全局体素 → 渲染 4 视角图像.
-        返回与 base.snapshot 兼容的格式 (固定 shape image tensors).
-        """
+    def _run_snapshot_counts(self, num_samples, batch_size, verbose):
         snap_ds = (self.test_dataset if hasattr(self, 'test_dataset') and self.test_dataset
                    else copy.deepcopy(self.dataset))
         loader = DataLoader(
-            snap_ds, batch_size=1, shuffle=True, num_workers=0,
+            snap_ds, batch_size=batch_size, shuffle=True, num_workers=0,
             collate_fn=snap_ds.collate_fn if hasattr(snap_ds, 'collate_fn') else None,
         )
         sampler = self.get_sampler()
-        vis_resolution = BLOCK_GRID * SUBMASK_RES  # 64*8 = 512
 
-        images_gt, images_pred = [], []
-        for i in range(num_samples):
+        tp, fp, fn = 0.0, 0.0, 0.0
+        sum_gt, sum_pred, total = 0.0, 0.0, 0
+
+        for i in range(0, num_samples, batch_size):
+            batch = min(batch_size, num_samples - i)
             data = next(iter(loader))
-            data = {k: (v.cuda() if isinstance(v, torch.Tensor) else
-                        v.to('cuda') if isinstance(v, sp.SparseTensor) else v)
+            data = {k: (v.to('cuda') if isinstance(v, sp.SparseTensor)
+                        else v[:batch].cuda() if isinstance(v, torch.Tensor)
+                        else v)
                     for k, v in data.items()}
 
             x_0 = data.pop('x_0')
+            gt = x_0.feats  # [T, 64]
+
             noise = x_0.replace(self.noise_scale * torch.randn_like(x_0.feats))
 
             args = self.get_inference_cond(**data)
@@ -247,33 +221,20 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
                 self.models['denoiser'], noise=noise,
                 **args, steps=50, cfg_strength=3.0, verbose=verbose,
             )
-            pred_feats = (res.samples.feats if hasattr(res.samples, 'feats')
-                          else res.samples)
+            pred = res.samples.feats if hasattr(res.samples, 'feats') else res.samples
 
-            # GT 渲染
-            gt_coords = self._submask_to_voxel_coords(x_0.coords, x_0.feats)
-            if gt_coords.shape[0] > 0:
-                images_gt.append(self._render_voxels(gt_coords, vis_resolution))
-            else:
-                images_gt.append(torch.zeros(3, 1024, 1024, device='cuda'))
+            pred_bin = (pred > 0.5).float()
+            gt_bin = (gt > 0.5).float()
 
-            # Pred 渲染
-            pred_coords = self._submask_to_voxel_coords(x_0.coords, pred_feats)
-            if pred_coords.shape[0] > 0:
-                images_pred.append(self._render_voxels(pred_coords, vis_resolution))
-            else:
-                images_pred.append(torch.zeros(3, 1024, 1024, device='cuda'))
+            tp += (pred_bin * gt_bin).sum().item()
+            fp += (pred_bin * (1 - gt_bin)).sum().item()
+            fn += ((1 - pred_bin) * gt_bin).sum().item()
+            sum_gt += gt_bin.sum().item()
+            sum_pred += pred_bin.sum().item()
+            total += gt.numel()
 
-        return {
-            'submask_gt': {
-                'value': torch.stack(images_gt),
-                'type': 'image',
-            },
-            'submask_pred': {
-                'value': torch.stack(images_pred),
-                'type': 'image',
-            },
-        }
+        return {'tp': tp, 'fp': fp, 'fn': fn,
+                'sum_gt': sum_gt, 'sum_pred': sum_pred, 'total': total}
 
     def get_sampler(self, **kwargs):
         return samplers.FlowSampler()

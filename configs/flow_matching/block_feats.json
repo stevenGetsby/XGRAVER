@@ -5,7 +5,7 @@
             "args": {
                 "resolution": 0,
                 "bottleneck_dim": 128,
-                "submask_resolution": 8,
+                "submask_resolution": 4,
                 "model_channels": 768,
                 "cond_channels": 1024,
                 "num_blocks": 12,

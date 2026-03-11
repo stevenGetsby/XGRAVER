@@ -6,7 +6,7 @@ __attributes = {
     'FlowMatchingCFGTrainer': 'flow_matching.flow_matching',
     'ImageConditionedFlowMatchingCFGTrainer': 'flow_matching.flow_matching',
     'ImageConditionedSparseMaskFlowCFGTrainer': 'flow_matching.mask_matching',
-    'ImageConditionedSparseFlowMultiTokenCFGTrainer': 'flow_matching.sr_matching',
+    'ImageConditionedSparseFlowMultiTokenCFGTrainer': 'flow_matching.feats_matching',
 }
 
 __submodules = []
@@ -39,7 +39,7 @@ if __name__ == '__main__':
         ImageConditionedFlowMatchingCFGTrainer,
     )
     
-    from .flow_matching.sr_matching import (
+    from .flow_matching.feats_matching import (
         SparseFlowMatchingTrainer,
         SparseFlowMatchingCFGTrainer,
         TextConditionedSparseFlowMatchingCFGTrainer,

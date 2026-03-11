@@ -43,6 +43,24 @@ class StandardDatasetBase(Dataset):
 
         # 整数 index, 与 self.instances 一一对齐 (不去重, 支持不同 root 同 sha256 不同数据)
         self.metadata = pd.concat(all_metadata, ignore_index=True)
+
+    def filter_existing_instances(self, exists_fn, stat_name: str = 'Existing files'):
+        keep_indices = []
+        counts = {os.path.basename(root): 0 for root in self.roots}
+        for i, (root, instance) in enumerate(self.instances):
+            if exists_fn(root, instance):
+                keep_indices.append(i)
+                counts[os.path.basename(root)] += 1
+
+        if len(keep_indices) == len(self.instances):
+            for key, count in counts.items():
+                self._stats[key][stat_name] = count
+            return
+
+        self.instances = [self.instances[i] for i in keep_indices]
+        self.metadata = self.metadata.iloc[keep_indices].reset_index(drop=True)
+        for key, count in counts.items():
+            self._stats[key][stat_name] = count
             
     @abstractmethod
     def filter_metadata(self, metadata: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:

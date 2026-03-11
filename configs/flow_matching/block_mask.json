@@ -3,8 +3,8 @@
         "denoiser": {
             "name": "SparseFlowModel",
             "args": {
-                "resolution": 8,
-                "bottleneck_dim": 0,
+                "resolution": 4,
+                "bottleneck_dim": 128,
                 "submask_resolution": 0,
                 "model_channels": 768,
                 "cond_channels": 1024,
@@ -22,25 +22,25 @@
         }
     },
     "dataset": {
-        "name": "ImageConditionedBlockSubmask",
+        "name": "ImageConditionedBlockMask",
         "args": {
             "roots": [
                 "/mnt/data/yizhao/TRAIN"
             ],
-            "max_block_num": 15000,
+            "max_block_num": 7000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 0
+            "max_samples": 200
         }
     },
     "test_dataset": {
-        "name": "ImageConditionedBlockSubmask",
+        "name": "ImageConditionedBlockMask",
         "args": {
             "roots": [
                 "/mnt/data/yizhao/TRAIN"
             ],
-            "max_block_num": 15000,
+            "max_block_num": 7000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 0
+            "max_samples": 200
         }
     },
     "trainer": {
@@ -50,6 +50,7 @@
             "batch_size_per_gpu": 4,
             "batch_split": 1,
             "noise_scale": 1.0,
+            "recall_weight": 3.0,
             "t_schedule": {
                 "name": "logitNormal",
                 "args": {
@@ -76,7 +77,7 @@
             "i_log": 200,
             "i_print": 10,
             "num_samples": 16,
-            "i_sample": 5000,
+            "i_sample": 2000,
             "i_save": 10000,
             "image_cond_model": "dinov2_vitl14_reg"
         }

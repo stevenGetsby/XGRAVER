@@ -10,6 +10,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 DEFAULT_FIELDS = ["sha256", "local_path", "rendered"]
 
+# 支持的 3D 文件格式（与 render.py IMPORT_FUNCTIONS 对齐）
+SUPPORTED_EXTENSIONS = {".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply", ".usd", ".usda", ".dae", ".abc"}
+
 
 def calculate_sha256(file_path: Path) -> str:
     """Calculate the SHA256 hash of a file (read in 1MB chunks for speed)."""
@@ -143,8 +146,8 @@ def build_metadata(root_dir, raw_dir_name="raw", output_filename="metadata.csv",
     elif overwrite and output_path.exists():
         print("Overwrite enabled, rebuilding metadata from scratch.")
 
-    print(f"Scanning for .glb files in {raw_path}...")
-    all_files = list(raw_path.rglob("*.glb"))
+    print(f"Scanning for 3D files in {raw_path}...")
+    all_files = [f for f in raw_path.rglob("*") if f.suffix.lower() in SUPPORTED_EXTENSIONS]
 
     # Filter out already-processed files
     to_process = []
@@ -153,7 +156,7 @@ def build_metadata(root_dir, raw_dir_name="raw", output_filename="metadata.csv",
         if local_path not in existing_files:
             to_process.append((str(file_path), str(root_path)))
 
-    print(f"Found {len(all_files)} .glb files, {len(to_process)} new to process.")
+    print(f"Found {len(all_files)} 3D files, {len(to_process)} new to process.")
 
     new_rows: List[Dict[str, str]] = []
     if to_process:
@@ -200,7 +203,7 @@ def build_metadata(root_dir, raw_dir_name="raw", output_filename="metadata.csv",
     print("Done!")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build metadata.csv for GLB files.")
+    parser = argparse.ArgumentParser(description="Build metadata.csv for 3D files (glb/stl/ply/obj/fbx/usd/dae/abc).")
     parser.add_argument("--root", type=str, default="/mnt/data/yizhao/JiTData", help="Root directory")
     parser.add_argument("--overwrite", action="store_true", help="Force rebuild metadata from scratch")
     args = parser.parse_args()

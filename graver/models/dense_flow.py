@@ -10,9 +10,7 @@ from ..dataset_toolkits.mesh2block import BLOCK_GRID
 
 
 class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
+    """Embeds scalar timesteps into vector representations."""
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -24,19 +22,6 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-
-        Args:
-            t: a 1-D Tensor of N indices, one per batch element.
-                These may be fractional.
-            dim: the dimension of the output.
-            max_period: controls the minimum frequency of the embeddings.
-
-        Returns:
-            an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
         freqs = torch.exp(
             -np.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
@@ -49,7 +34,6 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        # 添加这段:确保 t_freq 与模型权重类型一致
         if self.mlp[0].weight.dtype != t_freq.dtype:
             t_freq = t_freq.to(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
@@ -57,6 +41,10 @@ class TimestepEmbedder(nn.Module):
 
 
 class DenseFlowModel(nn.Module):
+    """
+    Dense flow model for Stage 1: 64³ occupancy prediction.
+    Patchifies 64³ volume into 8³ patches → 512 tokens → full attention.
+    """
     def __init__(
         self,
         model_channels: int,
@@ -76,7 +64,7 @@ class DenseFlowModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        resolution = BLOCK_GRID  # 64³ block occupancy
+        resolution = BLOCK_GRID
         in_channels = 1
         out_channels = 1
 
@@ -108,33 +96,26 @@ class DenseFlowModel(nn.Module):
             self.pos_embedder = AbsolutePositionEmbedder(model_channels, 3)
             grid_size = resolution // patch_size
             coords = torch.stack(torch.meshgrid(
-                torch.arange(grid_size), torch.arange(grid_size), torch.arange(grid_size), 
+                torch.arange(grid_size), torch.arange(grid_size), torch.arange(grid_size),
                 indexing='ij'
-            ), dim=-1).reshape(-1, 3) # [L, 3]
+            ), dim=-1).reshape(-1, 3)
             self.register_buffer("grid_coords", coords, persistent=False)
 
-        bottleneck_dim = bottleneck_dim
         self.input_layer = nn.Sequential(
             nn.Linear(in_channels * patch_size**3, bottleneck_dim),
-            nn.LayerNorm(bottleneck_dim), 
+            nn.LayerNorm(bottleneck_dim),
             nn.Linear(bottleneck_dim, model_channels)
         )
         self.blocks = nn.ModuleList([
             ModulatedTransformerCrossBlock(
-                model_channels,
-                cond_channels,
-                num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                attn_mode='full',
-                use_checkpoint=self.use_checkpoint,
-                use_rope=(pe_mode == "rope"),
-                share_mod=share_mod,
-                qk_rms_norm=self.qk_rms_norm,
-                qk_rms_norm_cross=self.qk_rms_norm_cross,
+                model_channels, cond_channels,
+                num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
+                attn_mode='full', use_checkpoint=self.use_checkpoint,
+                use_rope=(pe_mode == "rope"), share_mod=share_mod,
+                qk_rms_norm=self.qk_rms_norm, qk_rms_norm_cross=self.qk_rms_norm_cross,
             )
             for _ in range(num_blocks)
         ])
-
         self.out_layer = nn.Linear(model_channels, out_channels * patch_size**3)
 
         self.initialize_weights()
@@ -142,47 +123,30 @@ class DenseFlowModel(nn.Module):
             self.convert_to_fp16()
 
         grid_size = resolution // patch_size
-        n_tokens = grid_size ** 3
-        patch_dim = in_channels * patch_size**3
         n_params = sum(p.numel() for p in self.parameters()) / 1e6
         print(f"[DenseFlowModel] BLOCK_GRID={resolution}, patch={patch_size}, "
-              f"tokens={n_tokens}, patch_dim={patch_dim}, bottleneck={bottleneck_dim}, "
-              f"ch={in_channels}->{model_channels}x{num_blocks}->{out_channels}, "
-              f"attn=full, heads={self.num_heads}, fp16={use_fp16}, params={n_params:.1f}M")
+              f"tokens={grid_size**3}, ch={model_channels}x{num_blocks}, "
+              f"heads={self.num_heads}, fp16={use_fp16}, params={n_params:.1f}M")
 
     @property
     def device(self) -> torch.device:
-        """
-        Return the device of the model.
-        """
         return next(self.parameters()).device
 
-    def convert_to_fp16(self) -> None:
-        """
-        Convert the torso of the model to float16.
-        """
+    def convert_to_fp16(self):
         self.blocks.apply(convert_module_to_f16)
 
-    def convert_to_fp32(self) -> None:
-        """
-        Convert the torso of the model to float32.
-        """
+    def convert_to_fp32(self):
         self.blocks.apply(convert_module_to_f32)
 
-    def initialize_weights(self) -> None:
-        # Initialize transformer layers:
+    def initialize_weights(self):
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
-
-        # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
         if self.share_mod:
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
@@ -190,27 +154,22 @@ class DenseFlowModel(nn.Module):
             for block in self.blocks:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
         nn.init.constant_(self.out_layer.weight, 0)
         nn.init.constant_(self.out_layer.bias, 0)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         assert [*x.shape] == [x.shape[0], self.in_channels, *[self.resolution] * 3], \
-                f"Input shape mismatch, got {x.shape}, expected {[x.shape[0], self.in_channels, *[self.resolution] * 3]}"
+            f"Input shape mismatch, got {x.shape}"
 
         h = patchify(x, self.patch_size)
         h = h.view(*h.shape[:2], -1).permute(0, 2, 1).contiguous()
-
         h = self.input_layer(h)
         t_emb = self.t_embedder(t * 1000)
         if hasattr(self, "grid_coords"):
-            pos_emb = self.pos_embedder(self.grid_coords) # [L, D]
-            h = h + pos_emb.unsqueeze(0)
-
+            h = h + self.pos_embedder(self.grid_coords).unsqueeze(0)
         if self.share_mod:
             t_emb = self.adaLN_modulation(t_emb)
-            
+
         t_emb = t_emb.type(self.dtype)
         h = h.type(self.dtype)
         cond = cond.type(self.dtype)
@@ -219,8 +178,6 @@ class DenseFlowModel(nn.Module):
         h = h.type(x.dtype)
         h = F.layer_norm(h, h.shape[-1:])
         h = self.out_layer(h)
-
         h = h.permute(0, 2, 1).view(h.shape[0], h.shape[2], *[self.resolution // self.patch_size] * 3)
         h = unpatchify(h, self.patch_size).contiguous()
-
         return h

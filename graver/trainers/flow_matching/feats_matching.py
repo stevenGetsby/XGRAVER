@@ -113,24 +113,17 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         return super().compute_v_from_x_prediction(x_t, x_pred, t)
 
     # ------------------------------------------------------------------
-    # Selective masking: submask [T, 8] → per-voxel mask [T, 4096]
+    # Selective masking: submask [T, R^3] → per-voxel mask [T, 4096]
     # ------------------------------------------------------------------
 
     @staticmethod
     @torch.no_grad()
     def _upsample_submask(submask: torch.Tensor, block_dim: int = BLOCK_DIM) -> torch.Tensor:
-        """将 per-block SUBMASK_RES³ submask 上采样到 per-voxel BLOCK_DIM³ mask.
-        
-        Args:
-            submask: [T, SUBMASK_DIM] float (0/1)
-            block_dim: BLOCK_DIM
-            
-        Returns:
-            voxel_mask: [T, block_dim³] float (0/1)
-        """
+        """将 per-block SUBMASK_RES³ submask 直接上采样到 per-voxel BLOCK_DIM³ hard mask."""
         R = SUBMASK_RES
         T = submask.shape[0]
         sub_3d = submask.reshape(T, 1, R, R, R)
+
         scale = block_dim // R
         voxel_3d = F.interpolate(sub_3d, scale_factor=scale, mode='nearest')
         return voxel_3d.reshape(T, -1)

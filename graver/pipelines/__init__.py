@@ -1,5 +1,6 @@
 from . import samplers
 from .image_to_3d import GraverImageTo3DPipeline
+from .image_to_mesh import GraverImageToMeshPipeline
 
 def from_pretrained(path: str):
     """

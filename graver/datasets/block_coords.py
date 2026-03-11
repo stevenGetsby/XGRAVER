@@ -21,17 +21,27 @@ class BlockCoords(StandardDatasetBase):
         max_block_num: int = 15000,
         min_block_num: int = 0,
         min_aesthetic_score: float = 5.0,
+        max_samples: int = 0,
     ):
         self.resolution = BLOCK_GRID  # 64
         self.max_block_num = max_block_num
         self.min_block_num = min_block_num
         self.min_aesthetic_score = min_aesthetic_score
+        self.max_samples = max_samples
         self.value_range = (0, 1)
 
         self._col_prefix = COL_PREFIX
         self._block_prefix = BLOCK_FOLDER
 
         super().__init__(roots)
+        self.filter_existing_instances(
+            lambda root, instance: os.path.exists(os.path.join(root, self._block_prefix, f'{instance}.npz')),
+            stat_name='npz exists',
+        )
+
+        if self.max_samples > 0 and len(self.instances) > self.max_samples:
+            self.instances = self.instances[:self.max_samples]
+            self.metadata = self.metadata.iloc[:self.max_samples]
         
     def filter_metadata(self, metadata):
         stats = {}
@@ -128,7 +138,5 @@ class BlockCoords(StandardDatasetBase):
 
 
 class ImageConditionedBlockCoords(ImageConditionedMixin, BlockCoords):
-    """
-    Image-conditioned block coords dataset
-    """
+    """Image-conditioned block coords dataset."""
     pass

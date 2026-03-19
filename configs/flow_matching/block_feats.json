@@ -30,9 +30,9 @@
             "roots": [
                 "/mnt/data/yizhao/TRAIN"
             ],
-            "max_block_num": 13000,
+            "max_block_num": 7000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 0
+            "max_samples": 1000
         }
     },
     "test_dataset": {
@@ -41,9 +41,9 @@
             "roots": [
                  "/mnt/data/yizhao/TRAIN"
             ],
-            "max_block_num": 13000,
+            "max_block_num": 7000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 0
+            "max_samples": 1000
         }
     },
     "trainer": {

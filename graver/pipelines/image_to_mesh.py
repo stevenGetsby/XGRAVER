@@ -365,7 +365,7 @@ class GraverImageToMeshPipeline(Pipeline):
             verbose=verbose,
             **sampler_params,
         )
-        return (result.samples.feats > 0.0).float()
+        return (result.samples.feats > 0.5).float()
 
     @torch.no_grad()
     def sample_feats(self, cond: torch.Tensor, coords: torch.Tensor, submask: torch.Tensor, verbose: bool = True) -> torch.Tensor:

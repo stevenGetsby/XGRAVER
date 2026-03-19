@@ -23,7 +23,7 @@ class FlowMatchingTrainer(BasicTrainer):
         *args,
         t_schedule: dict = {
             'name': 'logitNormal',
-            'args': {'mean': 0.8, 'std': 0.8},
+            'args': {'mean': -0.8, 'std': 0.8},
         },
         cond_noise_std: float = 0.0,
         noise_scale: float = 1.0,

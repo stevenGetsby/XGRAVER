@@ -5,7 +5,7 @@ MODE=${1:-test}
 
 echo "=========================================="
 echo "Mask Training (mode=$MODE)"
-echo "  → 4³ submask sparse flow matching"
+echo "  → 8³ submask sparse flow matching"
 echo "=========================================="
 
 CONFIG_FILE="./configs/flow_matching/block_mask.json"

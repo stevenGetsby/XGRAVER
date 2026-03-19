@@ -3,7 +3,7 @@
         "denoiser": {
             "name": "SparseFlowModel",
             "args": {
-                "resolution": 4,
+                "resolution": 8,
                 "bottleneck_dim": 128,
                 "submask_resolution": 0,
                 "model_channels": 768,
@@ -29,7 +29,7 @@
             ],
             "max_block_num": 7000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 200
+            "max_samples": 0
         }
     },
     "test_dataset": {
@@ -40,7 +40,7 @@
             ],
             "max_block_num": 7000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 200
+            "max_samples": 0
         }
     },
     "trainer": {

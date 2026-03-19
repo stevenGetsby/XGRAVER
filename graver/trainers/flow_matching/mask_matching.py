@@ -2,7 +2,6 @@
 Stage 2 trainer: sparse flow matching on per-block submask [0,1].
 
 Standard continuous flow matching (v-loss) on submask values.
-No Bit Diffusion, no backbone head — clean independent sparse model.
 """
 from typing import *
 import os
@@ -27,7 +26,7 @@ from .mixins.image_conditioned import ImageConditionedMixin
 class SparseMaskFlowTrainer(FlowMatchingTrainer):
     """
     Sparse flow matching trainer for per-block submask prediction.
-    Submask ∈ [0,1]^64, treated as continuous targets with standard v-loss.
+    Submask ∈ [0,1]^512, standard v-loss with recall weighting.
     """
 
     def __init__(self, *args, recall_weight: float = 3.0, **kwargs):
@@ -90,7 +89,7 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
         return super().compute_v_from_x_prediction(x_t, x_pred, t)
 
     # ------------------------------------------------------------------
-    # Training losses — standard v-loss with recall weighting
+    # Training losses — MSE v-loss with recall weighting
     # ------------------------------------------------------------------
 
     def training_losses(self, x_0=None, cond=None, **kwargs) -> Tuple[Dict, Dict]:
@@ -113,7 +112,7 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
 
         # Recall-biased weighting: surface cells (GT=1) get higher weight
         with torch.no_grad():
-            w = 1.0 + (self.recall_weight - 1.0) * x_0.feats  # [T, 64]
+            w = 1.0 + (self.recall_weight - 1.0) * x_0.feats
 
         mse = (w * (v_pred.feats - v_target.feats) ** 2).mean()
 
@@ -212,7 +211,7 @@ class SparseMaskFlowTrainer(FlowMatchingTrainer):
                     for k, v in data.items()}
 
             x_0 = data.pop('x_0')
-            gt = x_0.feats  # [T, 64]
+            gt = x_0.feats
 
             noise = x_0.replace(self.noise_scale * torch.randn_like(x_0.feats))
 

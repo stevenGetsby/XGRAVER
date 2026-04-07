@@ -206,7 +206,7 @@ class FlowMatchingTrainer(BasicTrainer):
             # --- Normal map rendering via GT feats ---
             try:
                 ds = self.test_dataset if hasattr(self, 'test_dataset') and self.test_dataset else self.dataset
-                n_normal = min(num_samples, pred.shape[0], 4)
+                n_normal = min(num_samples, pred.shape[0])
                 tmps = []
                 for si in range(n_normal):
                     # Extract predicted active coords from 64³ grid

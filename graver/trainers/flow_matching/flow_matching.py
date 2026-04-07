@@ -96,15 +96,19 @@ class FlowMatchingTrainer(BasicTrainer):
     @torch.no_grad()
     def run_snapshot(self, num_samples, batch_size, verbose=False):
         snap_ds = self.test_dataset if hasattr(self, 'test_dataset') and self.test_dataset else copy.deepcopy(self.dataset)
-        loader = DataLoader(snap_ds, batch_size=batch_size, shuffle=True, num_workers=0,
-                            collate_fn=snap_ds.collate_fn if hasattr(snap_ds, 'collate_fn') else None)
         sampler = self.get_sampler()
+        indices = torch.randperm(len(snap_ds))[:num_samples].tolist()
         sample_gt, sample_pred = [], []
 
         for i in range(0, num_samples, batch_size):
-            batch = min(batch_size, num_samples - i)
-            data = next(iter(loader))
-            data = {k: v[:batch].cuda() if isinstance(v, torch.Tensor) else v[:batch] for k, v in data.items()}
+            batch_indices = indices[i:i + batch_size]
+            items = [snap_ds[idx] for idx in batch_indices]
+            collate_fn = snap_ds.collate_fn if hasattr(snap_ds, 'collate_fn') else None
+            if collate_fn:
+                data = collate_fn(items)
+            else:
+                data = torch.utils.data.dataloader.default_collate(items)
+            data = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
             noise = torch.randn_like(data['x_0']) * self.noise_scale
             sample_gt.append(data['x_0'])
             del data['x_0']
@@ -119,7 +123,7 @@ class FlowMatchingTrainer(BasicTrainer):
                                      steps=50, cfg_strength=3.0, verbose=verbose)
             sample_pred.append(res.samples)
 
-        return torch.cat(sample_gt, 0), torch.cat(sample_pred, 0)
+        return torch.cat(sample_gt, 0), torch.cat(sample_pred, 0), indices
 
     @staticmethod
     def _binary_metric_counts(pred, gt):
@@ -145,7 +149,7 @@ class FlowMatchingTrainer(BasicTrainer):
             suffix = f'step{self.step:07d}'
 
         n_per_rank = int(np.ceil(num_samples / self.world_size))
-        gt, pred = self.run_snapshot(n_per_rank, batch_size, verbose)
+        gt, pred, snap_indices = self.run_snapshot(n_per_rank, batch_size, verbose)
 
         # Metrics (all-reduce)
         counts = self._binary_metric_counts(pred, gt)
@@ -211,8 +215,8 @@ class FlowMatchingTrainer(BasicTrainer):
                     pred_coords = np.argwhere(pred_occ).astype(np.int32)  # [M, 3]
                     gt_coords = np.argwhere(gt_occ).astype(np.int32)
 
-                    # Load GT feats for this sample
-                    idx = si % len(ds)
+                    # Load GT feats for this sample using the correct dataset index
+                    idx = snap_indices[si] if si < len(snap_indices) else si % len(ds)
                     root, inst = ds.instances[idx]
                     npz_path = os.path.join(root, BLOCK_FOLDER, f'{inst}.npz')
                     if not os.path.exists(npz_path):

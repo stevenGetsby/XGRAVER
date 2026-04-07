@@ -181,6 +181,7 @@ class SparseFlowModel(nn.Module):
         pool_stride: int = 8,
         pool_stride_coarse: int = 0,
         num_pooled_layers: int = 0,
+        coarse_resolution: int = 0,
         **kwargs,
     ):
         super().__init__()
@@ -227,6 +228,12 @@ class SparseFlowModel(nn.Module):
             )
 
         self.predict = nn.Linear(model_channels, token_dim)
+
+        # Optional coarse prediction head (two-stage: predict avg-pooled UDF)
+        self.coarse_resolution = coarse_resolution
+        if coarse_resolution > 0:
+            coarse_dim = coarse_resolution ** 3
+            self.coarse_head = nn.Linear(model_channels, coarse_dim)
 
         self.final_norm = LayerNorm32(model_channels, elementwise_affine=False, eps=1e-6)
 
@@ -350,6 +357,11 @@ class SparseFlowModel(nn.Module):
         nn.init.zeros_(self.predict.weight)
         nn.init.zeros_(self.predict.bias)
 
+        # coarse_head zero-init (if present)
+        if hasattr(self, 'coarse_head'):
+            nn.init.zeros_(self.coarse_head.weight)
+            nn.init.zeros_(self.coarse_head.bias)
+
         # mask_embed zero-init (if present)
         if hasattr(self, 'mask_embed'):
             nn.init.zeros_(self.mask_embed[-1].weight)
@@ -403,4 +415,10 @@ class SparseFlowModel(nn.Module):
 
         if return_decoder_feats:
             return out, h
+
+        # Optional coarse prediction (training only)
+        if hasattr(self, 'coarse_head') and self.coarse_resolution > 0 and self.training:
+            coarse_pred = self.coarse_head(h_out.type(x.dtype))
+            return out, coarse_pred
+
         return out

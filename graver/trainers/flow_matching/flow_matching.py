@@ -173,6 +173,21 @@ class FlowMatchingTrainer(BasicTrainer):
                 dist.gather(val, all_vis, dst=0)
                 if self.is_master:
                     vis_images[tag] = torch.cat(all_vis, 0)[:num_samples].cpu()
+            # Gather raw pred/gt/indices for normal rendering
+            if self.is_master:
+                all_gt = [torch.empty_like(gt) for _ in range(self.world_size)]
+                all_pred = [torch.empty_like(pred) for _ in range(self.world_size)]
+            else:
+                all_gt, all_pred = [], []
+            dist.gather(gt.contiguous(), all_gt, dst=0)
+            dist.gather(pred.contiguous(), all_pred, dst=0)
+            idx_tensor = torch.tensor(snap_indices, device='cuda', dtype=torch.long)
+            all_idx = [torch.empty_like(idx_tensor) for _ in range(self.world_size)]
+            dist.all_gather(all_idx, idx_tensor)
+            if self.is_master:
+                gt = torch.cat(all_gt, 0)[:num_samples]
+                pred = torch.cat(all_pred, 0)[:num_samples]
+                snap_indices = torch.cat(all_idx, 0)[:num_samples].cpu().tolist()
         else:
             vis_images['sample_gt'] = gt_vis[:num_samples].cpu()
             vis_images['sample'] = pred_vis[:num_samples].cpu()

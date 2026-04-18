@@ -1,0 +1,54 @@
+{
+    "args": {
+        "image_cond_model": "dinov2_vitl14_reg",
+        "stages": {
+            "coords": {
+                "config": "../configs/flow_matching/block_coords.json",
+                "load_dir": "<FILL_IN: path to coords checkpoint dir, e.g. ../ckpt/coords_test>",
+                "ckpt": "latest",
+                "ema_rate": 0.999,
+                "model_key": "denoiser",
+                "noise_scale": 1.0,
+                "threshold": 0.5,
+                "sampler": {
+                    "name": "FlowCfgSampler",
+                    "params": {
+                        "cfg_strength": 3.0,
+                        "steps": 50
+                    }
+                }
+            },
+            "mask": {
+                "config": "../configs/flow_matching/block_mask.json",
+                "load_dir": "<FILL_IN: path to mask checkpoint dir, e.g. ../ckpt/mask_test>",
+                "ckpt": "latest",
+                "ema_rate": 0.999,
+                "model_key": "denoiser",
+                "noise_scale": 1.0,
+                "sampler": {
+                    "name": "FlowCfgSampler",
+                    "params": {
+                        "cfg_strength": 3.0,
+                        "steps": 50
+                    }
+                }
+            },
+            "feats": {
+                "config": "../configs/flow_matching/block_feats.json",
+                "load_dir": "<FILL_IN: path to feats checkpoint dir, e.g. ../ckpt/feats_test>",
+                "ckpt": "latest",
+                "ema_rate": 0.999,
+                "model_key": "denoiser",
+                "noise_scale": 2.0,
+                "sampler": {
+                    "name": "FlowGuidanceIntervalSampler",
+                    "params": {
+                        "cfg_strength": 3.0,
+                        "cfg_interval": [0.1, 1.0],
+                        "steps": 50
+                    }
+                }
+            }
+        }
+    }
+}

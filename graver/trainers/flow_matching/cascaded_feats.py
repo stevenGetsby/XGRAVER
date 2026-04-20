@@ -1,16 +1,12 @@
 """
-Stage 3 Cascaded Trainer (clean v14): triangle-weighted loss centred on MC iso.
+Stage 3 Cascaded Trainer v5: exact feats_matching recipe with dil_2x pred mask.
 
 Design:
-  - voxel_mask = dilate(pred_submask, k=3, iters=2)      # cascade hard-fill
-  - Noise / GT / x_t hard-filled to bg_fill on mask=0    # train=infer consistent
-  - Loss weight (only on mask=1):
-        tri(g) = max(0, 1 - |g - v| / v)       # v = MC_THRESHOLD = 0.2
-        w(g)   = w_low + (w_high - w_low) * tri(g)
-      → peak w_high at g=v=0.2 (iso), linearly decays to w_low at g=0 and g=2v=0.4,
-        flat w_low for g>=2v (non-surface band).
-  - flow_loss = Σ(diff² · w) / Σ(w)  per block (single term, no stacking).
-  - No edge-crossing / no complexity boost / no surface_weight / no 3-band split.
+  - voxel_mask = dilate(pred_submask, k=3, iters=2)
+  - Noise / GT / x_t hard-filled to bg_fill on mask=0
+  - Loss: exact feats_matching recipe (mc/near/far 3-band + surface_weight
+    + complexity_boost) applied only on mask=1 positions.
+  - gt_clip_max optional (clips far-field GT, bg_fill = gt_clip_max or 1.0).
 """
 from typing import *
 import os
@@ -41,29 +37,25 @@ class CascadedFeatsTrainer(SparseFlowMultiTokenTrainer):
         cascade_dilate_iters: int = 2,
         cascade_dilate_kernel: int = 3,
         gt_clip_max: Optional[float] = None,
-        w_high: float = 10.0,
-        w_low: float = 1.0,
         **kwargs,
     ):
-        # Pop legacy params
+        # Pop legacy / v14 params that parent doesn't know
         for k in ('cascade_mask_config', 'cascade_mask_weight',
                   'cascade_mask_threshold', 'cascade_lambda_far',
                   'cascade_weak_noise_std', 'cascade_far_weight',
-                  'cascade_trunc_threshold'):
+                  'cascade_trunc_threshold', 'w_high', 'w_low'):
             kwargs.pop(k, None)
 
         self._cascade_dilate_iters = cascade_dilate_iters
         self._cascade_dilate_kernel = cascade_dilate_kernel
         self._gt_clip_max = float(gt_clip_max) if gt_clip_max is not None else None
-        self._w_high = float(w_high)
-        self._w_low = float(w_low)
 
         super().__init__(*args, **kwargs)
 
-        print(f"[CascadedFeatsTrainer v14-clean] dilate k={cascade_dilate_kernel}, "
+        print(f"[CascadedFeatsTrainer v5] dilate k={cascade_dilate_kernel}, "
               f"iters={cascade_dilate_iters} | gt_clip_max={self._gt_clip_max} | "
-              f"triangle weight: w_high={self._w_high} @g=v(0.2), "
-              f"w_low={self._w_low} @g=0 / g>=2v(0.4)")
+              f"exact feats_matching recipe (mc/near/far {self.surface_weight}/3/1 "
+              f"+ complexity_boost={self.complexity_boost})")
 
     # ------------------------------------------------------------------
     # Dilation helpers
@@ -90,7 +82,7 @@ class CascadedFeatsTrainer(SparseFlowMultiTokenTrainer):
         )
 
     # ------------------------------------------------------------------
-    # Training losses (clean triangle-weighted on mask=1)
+    # Training losses (exact feats_matching recipe on mask=1)
     # ------------------------------------------------------------------
 
     def training_losses(
@@ -146,62 +138,76 @@ class CascadedFeatsTrainer(SparseFlowMultiTokenTrainer):
         # ---- Forward ----
         pred = self.training_models["denoiser"](x_t, t, cond)
 
-        # ---- Residual (v-loss or flow-loss) ----
+        # ---- Residual ----
+        x_residual = pred.feats - x_masked.feats
         t_per_token = self._expand_t_to_tokens(t, x.layout, T)
+
         if self.loss_type == "v_loss":
             v_denom = (1 - t_per_token).clamp(min=0.05)
-            diff_sq = ((pred.feats - x_masked.feats) / v_denom) ** 2
+            diff = (x_residual / v_denom) ** 2
         else:
-            diff_sq = (pred.feats - x_masked.feats) ** 2
+            diff = x_residual ** 2
 
-        # ---- Triangle weight centred on iso=v ----
-        # tri(g) = max(0, 1 - |g - v| / v)   → 1 at g=v, 0 at g=0 and g=2v.
-        # w(g)   = w_low + (w_high - w_low) * tri(g), masked to mask=1.
+        # Only mask=1 positions
+        diff = diff * voxel_mask
+
+        # ---- Exact feats_matching 3-band weighting ----
         with torch.no_grad():
-            g = x_masked.feats
-            tri = (1.0 - (g - v).abs() / v).clamp(min=0.0)
-            weight = (self._w_low
-                      + (self._w_high - self._w_low) * tri) * voxel_mask
+            mc_mask   = (x_masked.feats < v * 2).float()
+            far_mask  = (x_masked.feats > v * 3).float()
+            near_mask = (1.0 - mc_mask) * (1.0 - far_mask)
 
-        # ---- Single weighted MSE per block ----
-        num = (diff_sq * weight).sum(dim=1)
-        den = weight.sum(dim=1).clamp(min=1e-6)
-        block_loss = num / den
+        block_loss_mc   = (diff * mc_mask  ).sum(dim=1) / mc_mask  .sum(dim=1).clamp(min=1)
+        block_loss_near = (diff * near_mask).sum(dim=1) / near_mask.sum(dim=1).clamp(min=1)
+        block_loss_far  = (diff * far_mask ).sum(dim=1) / far_mask .sum(dim=1).clamp(min=1)
+
+        block_loss = (
+            self.surface_weight * block_loss_mc
+            + 3.0 * block_loss_near
+            + 1.0 * block_loss_far
+        )
+
+        # Complexity reweighting
+        with torch.no_grad():
+            complexity_w = self._neighborhood_complexity(
+                x_masked.feats, x.coords, x.layout,
+                self.voxel, self.complexity_boost,
+            )
+        block_loss = block_loss * complexity_w
 
         per_sample_loss = torch.stack([block_loss[sl].mean() for sl in x.layout])
         terms["flow_loss"] = per_sample_loss.mean()
+        terms["complexity_avg"] = complexity_w.mean()
+
+        per_sample_mc   = torch.stack([block_loss_mc[sl].mean()   for sl in x.layout])
+        per_sample_near = torch.stack([block_loss_near[sl].mean() for sl in x.layout])
+        per_sample_far  = torch.stack([block_loss_far[sl].mean()  for sl in x.layout])
+        terms["loss_mc"]   = per_sample_mc.mean()
+        terms["loss_near"] = per_sample_near.mean()
+        terms["loss_far"]  = per_sample_far.mean()
+
         terms["loss"] = self.lambda_flow * terms["flow_loss"]
 
         if self.lambda_normal > 0:
             terms["normal_loss"] = self._normal_loss(pred.feats, x_masked.feats)
             terms["loss"] = terms["loss"] + self.lambda_normal * terms["normal_loss"]
 
-        # ---- Monitoring metrics (detached, do not affect backprop) ----
+        # ---- Monitoring (detached) ----
         with torch.no_grad():
-            vmask_bool = voxel_mask > 0.5
-            surf_mask = ((g < 2 * v) & vmask_bool).float()   # MC interp band
-            far_mask  = ((g >= 2 * v) & vmask_bool).float()
-            block_surf = (diff_sq * surf_mask).sum(dim=1) / surf_mask.sum(dim=1).clamp(min=1)
-            block_far  = (diff_sq * far_mask ).sum(dim=1) / far_mask .sum(dim=1).clamp(min=1)
-            terms["loss_surface"]   = torch.stack([block_surf[sl].mean() for sl in x.layout]).mean()
-            terms["loss_far"]       = torch.stack([block_far [sl].mean() for sl in x.layout]).mean()
-            terms["loss_mc_legacy"] = terms["loss_surface"]   # alias for cross-run compare
-
-            batch_loss = per_sample_loss
+            batch_loss = torch.stack([block_loss[sl].mean() for sl in x.layout])
             for lo, hi in [(0.0, 0.3), (0.3, 0.7), (0.7, 1.0)]:
                 mt = (t >= lo) & (t < hi)
                 if mt.any():
                     terms[f"loss_t{lo:.1f}_{hi:.1f}"] = batch_loss[mt].mean()
 
-            terms["mask_ratio"]  = float(voxel_mask.mean())
-            terms["weight_mean"] = float(weight[vmask_bool].mean()) if vmask_bool.any() else 0.0
+            terms["mask_ratio"] = float(voxel_mask.mean())
 
             if submask is not None and pred_submask is not None:
                 gt_voxel = self._upsample_submask(submask.to(device))
                 gt_b = gt_voxel > 0.5
-                dil_b = vmask_bool
+                dil_b = voxel_mask > 0.5
                 gt_total = gt_b.sum().clamp(min=1)
-                terms["gt_recall"]    = float((gt_b & dil_b).sum() / gt_total)
+                terms["gt_recall"] = float((gt_b & dil_b).sum() / gt_total)
                 terms["deep_fn_ratio"] = float((gt_b & ~dil_b).sum() / gt_total)
 
         return terms, {}

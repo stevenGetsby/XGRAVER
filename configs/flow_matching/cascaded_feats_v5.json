@@ -6,11 +6,11 @@
                 "resolution": 0,
                 "bottleneck_dim": 128,
                 "submask_resolution": 0,
-                "model_channels": 1024,
+                "model_channels": 768,
                 "cond_channels": 1024,
-                "num_blocks": 16,
+                "num_blocks": 12,
                 "num_pooled_layers": 4,
-                "num_heads": 16,
+                "num_heads": 12,
                 "mlp_ratio": 4,
                 "pe_mode": "rope",
                 "attn_mode": "windowed",
@@ -32,7 +32,8 @@
             ],
             "max_block_num": 12000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 0
+            "max_samples": 0,
+            "require_pred_mask": false
         }
     },
     "test_dataset": {
@@ -43,7 +44,8 @@
             ],
             "max_block_num": 12000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 100
+            "max_samples": 0,
+            "require_pred_mask": false
         }
     },
     "trainer": {
@@ -54,13 +56,13 @@
             "batch_split": 1,
             "noise_scale": 1.0,
             "loss_type": "v_loss",
-            "lambda_normal": 0.01,
+            "lambda_normal": 0.05,
+            "surface_weight": 8.0,
+            "complexity_boost": 2.0,
             "cond_noise_std": 0.0,
             "cascade_dilate_kernel": 3,
             "cascade_dilate_iters": 2,
             "gt_clip_max": 0.5,
-            "w_high": 10.0,
-            "w_low": 1.0,
             "t_schedule": {
                 "name": "logitNormal",
                 "args": {
@@ -88,7 +90,7 @@
             "i_print": 10,
             "num_samples": 16,
             "i_sample": 5000,
-            "i_save": 5000,
+            "i_save": 10000,
             "image_cond_model": "dinov2_vitl14_reg"
         }
     }

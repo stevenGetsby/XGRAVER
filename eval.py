@@ -298,11 +298,14 @@ def sample_feats(model, cond: torch.Tensor, coords: torch.Tensor,
                  submask: torch.Tensor, *, noise_scale: float = 2.0,
                  cfg_strength: float = 3.0,
                  cfg_interval: Tuple[float, float] = (0.1, 1.0),
-                 steps: int = 50, device: str = 'cuda') -> torch.Tensor:
+                 steps: int = 50, device: str = 'cuda',
+                 gt_clip_max: Optional[float] = None) -> torch.Tensor:
     """GT coords + submask → model(noise) → 预测 fine_feats.
 
     submask 必须已匹配 model.submask_resolution 维度;
     voxel_mask 从 submask 上采样到 BLOCK_DIM³, 用于 noise masking (与训练一致).
+    gt_clip_max: 若训练时使用了 truncated UDF (clamp GT to [0, clip_max]),
+                 推理也用同一值做 hard-fill 和 clamp 上界.
     """
     batch_coords = torch.cat([
         torch.zeros(coords.shape[0], 1, device=device, dtype=torch.int32),
@@ -313,21 +316,24 @@ def sample_feats(model, cond: torch.Tensor, coords: torch.Tensor,
     submask_res = _detect_submask_res(submask_d)
     voxel_mask = _upsample_submask_to_voxel(submask_d, submask_res)
 
-    # noise masking: mask=0 位置填确定值 1.0 (与训练一致)
+    bg_fill = float(gt_clip_max) if gt_clip_max is not None else 1.0
+    clamp_hi = bg_fill
+
+    # noise masking: mask=0 位置填确定值 bg_fill (与训练一致)
     noise_raw = torch.randn(batch_coords.shape[0], model.token_dim, device=device) * noise_scale
-    noise_raw = noise_raw * voxel_mask + (1.0 - voxel_mask) * 1.0
+    noise_raw = noise_raw * voxel_mask + (1.0 - voxel_mask) * bg_fill
     noise = SparseTensor(feats=noise_raw, coords=batch_coords)
 
     sampler = FlowGuidanceIntervalSampler()
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         result = sampler.sample(
             model, noise=noise, cond=cond, neg_cond=torch.zeros_like(cond),
-            submask=submask_d, voxel_mask=voxel_mask,
+            submask=submask_d, voxel_mask=voxel_mask, bg_fill=bg_fill,
             cfg_strength=cfg_strength, cfg_interval=cfg_interval,
             steps=steps, verbose=True,
         )
-    pred = result.samples.feats.float() * voxel_mask + (1.0 - voxel_mask) * 1.0
-    return pred.clamp(0.0, 1.0)
+    pred = result.samples.feats.float() * voxel_mask + (1.0 - voxel_mask) * bg_fill
+    return pred.clamp(0.0, clamp_hi)
 
 
 # =====================================================================

@@ -32,6 +32,12 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         complexity_boost: float = 2.0,
         cond_noise_std: float = 0.0,
         noise_scale: float = 2.0,
+        # Cascaded training: use frozen mask model to predict submask
+        cascade_mask_config: str = "",
+        cascade_mask_weight: str = "",
+        cascade_mask_prob: float = 0.0,
+        cascade_weak_noise_std: float = 0.05,
+        cascade_mask_threshold: float = 0.5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -43,12 +49,44 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         self.loss_type = loss_type
         self.noise_scale = noise_scale
         self.voxel = MC_THRESHOLD
+        self.cascade_mask_prob = cascade_mask_prob
+        self.cascade_weak_noise_std = cascade_weak_noise_std
+        self.cascade_mask_threshold = cascade_mask_threshold
+        self._cascade_mask_model = None
+
+        # Load frozen mask model if configured
+        if cascade_mask_config and cascade_mask_weight and cascade_mask_prob > 0:
+            self._init_cascade_mask(cascade_mask_config, cascade_mask_weight)
 
         print(f"[MultiTokenTrainer] loss_type={self.loss_type}, "
               f"λ_flow={lambda_flow}, λ_normal={lambda_normal}, "
               f"surface_weight={surface_weight}, "
               f"complexity_boost={complexity_boost}, "
               f"noise_scale={noise_scale}")
+        if self._cascade_mask_model is not None:
+            print(f"[CascadeTraining] mask_prob={cascade_mask_prob}, "
+                  f"weak_noise_std={cascade_weak_noise_std}, "
+                  f"threshold={cascade_mask_threshold}")
+
+    def _init_cascade_mask(self, config_path: str, weight_path: str):
+        """Load frozen mask model for cascaded training."""
+        import json
+        from ... import models as model_registry
+
+        with open(config_path) as f:
+            cfg = json.load(f)
+        model_cfg = cfg['models']['denoiser']
+        mask_model = getattr(model_registry, model_cfg['name'])(**model_cfg['args'])
+        state_dict = torch.load(weight_path, map_location='cpu', weights_only=True)
+        mask_model.load_state_dict(state_dict, strict=False)
+        mask_model.eval()
+        for p in mask_model.parameters():
+            p.requires_grad_(False)
+        # Will be moved to device on first use
+        self._cascade_mask_model = mask_model
+        n_params = sum(p.numel() for p in mask_model.parameters()) / 1e6
+        print(f"[CascadeTraining] Loaded frozen mask model: {model_cfg['name']} "
+              f"({n_params:.1f}M params) from {weight_path}")
 
     # ------------------------------------------------------------------
     # Dataloader

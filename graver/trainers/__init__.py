@@ -7,6 +7,7 @@ __attributes = {
     'ImageConditionedFlowMatchingCFGTrainer': 'flow_matching.flow_matching',
     'ImageConditionedSparseFlowMultiTokenCFGTrainer': 'flow_matching.feats_matching',
     'ImageConditionedDirectMaskTrainer': 'flow_matching.direct_mask',
+    'ImageConditionedCascadedFeatsCFGTrainer': 'flow_matching.cascaded_feats',
 }
 
 __submodules = []

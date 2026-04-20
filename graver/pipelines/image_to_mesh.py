@@ -373,8 +373,12 @@ class GraverImageToMeshPipeline(Pipeline):
         params = self.stage_params['feats']
         voxel_mask = self._upsample_submask(submask)
 
+        gt_clip_max = params.get('gt_clip_max', None)
+        bg_fill = float(gt_clip_max) if gt_clip_max is not None else 1.0
+        clamp_hi = bg_fill
+
         noise_raw = torch.randn(coords.shape[0], model.token_dim, device=self.device) * params['noise_scale']
-        noise_raw = noise_raw * voxel_mask + (1.0 - voxel_mask) * 1.0
+        noise_raw = noise_raw * voxel_mask + (1.0 - voxel_mask) * bg_fill
         noise = sp.SparseTensor(feats=noise_raw, coords=coords)
 
         sampler_params = dict(params['sampler_params'])
@@ -385,11 +389,12 @@ class GraverImageToMeshPipeline(Pipeline):
             neg_cond=torch.zeros_like(cond),
             submask=submask,
             voxel_mask=voxel_mask,
+            bg_fill=bg_fill,
             verbose=verbose,
             **sampler_params,
         )
-        pred = result.samples.feats * voxel_mask + (1.0 - voxel_mask) * 1.0
-        return pred.clamp(0.0, 1.0)
+        pred = result.samples.feats * voxel_mask + (1.0 - voxel_mask) * bg_fill
+        return pred.clamp(0.0, clamp_hi)
 
     @torch.no_grad()
     def run(

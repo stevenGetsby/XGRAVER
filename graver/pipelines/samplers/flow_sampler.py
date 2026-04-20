@@ -8,16 +8,16 @@ from .classifier_free_guidance_mixin import ClassifierFreeGuidanceSamplerMixin
 from .guidance_interval_mixin import GuidanceIntervalSamplerMixin
 
 
-def _apply_voxel_mask(z, voxel_mask):
-    """mask=0 的位置强制 = 1.0 (远场确定值)"""
+def _apply_voxel_mask(z, voxel_mask, bg_fill: float = 1.0):
+    """mask=0 的位置强制 = bg_fill (远场确定值, 默认 1.0)"""
     if voxel_mask is None:
         return z
     if hasattr(z, 'feats'):
         # SparseTensor
-        masked_feats = z.feats * voxel_mask + (1.0 - voxel_mask) * 1.0
+        masked_feats = z.feats * voxel_mask + (1.0 - voxel_mask) * bg_fill
         return z.replace(masked_feats)
     else:
-        return z * voxel_mask + (1.0 - voxel_mask) * 1.0
+        return z * voxel_mask + (1.0 - voxel_mask) * bg_fill
 
 
 class FlowSampler(Sampler):
@@ -78,7 +78,8 @@ class FlowSampler(Sampler):
 
         # Heun 修正前 mask z_mid, 保持和训练一致
         voxel_mask = kwargs.get('voxel_mask', None)
-        z_mid = _apply_voxel_mask(z_mid, voxel_mask)
+        bg_fill = kwargs.get('bg_fill', 1.0)
+        z_mid = _apply_voxel_mask(z_mid, voxel_mask, bg_fill)
 
         # Heun 修正: 用 z_mid 处的速度做平均
         t_next_tensor = torch.full((z_t.shape[0],), t_next, device=z_t.device, dtype=z_t.dtype)
@@ -101,6 +102,7 @@ class FlowSampler(Sampler):
     ):
         # 提取 voxel_mask (如果有 submask, 上采样到 per-voxel)
         voxel_mask = kwargs.pop('voxel_mask', None)
+        bg_fill = kwargs.pop('bg_fill', 1.0)
 
         z_t = noise
         t_seq = np.linspace(0.0, 1.0, steps + 1)

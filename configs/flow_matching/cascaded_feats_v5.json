@@ -51,18 +51,17 @@
     "trainer": {
         "name": "ImageConditionedCascadedFeatsCFGTrainer",
         "args": {
-            "max_steps": 200000,
+            "max_steps": 100000,
             "batch_size_per_gpu": 2,
             "batch_split": 1,
-            "noise_scale": 1.0,
+            "noise_scale": 2.0,
             "loss_type": "v_loss",
-            "lambda_normal": 0.05,
+            "lambda_normal": 0.1,
             "surface_weight": 8.0,
             "complexity_boost": 2.0,
             "cond_noise_std": 0.0,
             "cascade_dilate_kernel": 3,
             "cascade_dilate_iters": 2,
-            "gt_clip_max": 0.5,
             "t_schedule": {
                 "name": "logitNormal",
                 "args": {
@@ -78,7 +77,7 @@
                     "betas": [0.9, 0.95]
                 }
             },
-            "ema_rate": [0.9999],
+            "ema_rate": [0.999],
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
                 "args": {
@@ -89,8 +88,8 @@
             "i_log": 200,
             "i_print": 10,
             "num_samples": 16,
-            "i_sample": 5000,
-            "i_save": 10000,
+            "i_sample": 2500,
+            "i_save": 5000,
             "image_cond_model": "dinov2_vitl14_reg"
         }
     }

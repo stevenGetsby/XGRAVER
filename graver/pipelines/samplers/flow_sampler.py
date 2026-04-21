@@ -52,6 +52,8 @@ class FlowSampler(Sampler):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def sample_once(self, model, z_t, t, t_next, cond=None, **kwargs):
+        kwargs.pop('voxel_mask', None)
+        kwargs.pop('bg_fill', None)
         t_tensor = torch.full((z_t.shape[0],), t, device=z_t.device, dtype=z_t.dtype)
         pred_x, pred_v = self._get_pred_v(model, z_t, t, t_tensor, cond, **kwargs)
 
@@ -66,6 +68,8 @@ class FlowSampler(Sampler):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def heun_sample_once(self, model, z_t, t, t_next, cond=None, **kwargs):
+        voxel_mask = kwargs.pop('voxel_mask', None)
+        bg_fill = kwargs.pop('bg_fill', 1.0)
         t_tensor = torch.full((z_t.shape[0],), t, device=z_t.device, dtype=z_t.dtype)
         pred_x, pred_v = self._get_pred_v(model, z_t, t, t_tensor, cond, **kwargs)
 
@@ -77,8 +81,6 @@ class FlowSampler(Sampler):
         z_mid = z_t + dt * pred_v
 
         # Heun 修正前 mask z_mid, 保持和训练一致
-        voxel_mask = kwargs.get('voxel_mask', None)
-        bg_fill = kwargs.get('bg_fill', 1.0)
         z_mid = _apply_voxel_mask(z_mid, voxel_mask, bg_fill)
 
         # Heun 修正: 用 z_mid 处的速度做平均
@@ -100,7 +102,7 @@ class FlowSampler(Sampler):
         use_heun: bool = False,
         **kwargs,
     ):
-        # 提取 voxel_mask (如果有 submask, 上采样到 per-voxel)
+        # 提取 voxel_mask / bg_fill: pop 避免传入 model forward
         voxel_mask = kwargs.pop('voxel_mask', None)
         bg_fill = kwargs.pop('bg_fill', 1.0)
 
@@ -110,8 +112,9 @@ class FlowSampler(Sampler):
         step_fn = self.heun_sample_once if use_heun else self.sample_once
 
         for t, t_next in tqdm(t_pairs, desc="Sampling", disable=not verbose):
-            out = step_fn(model, z_t, t, t_next, cond, **kwargs)
-            z_t = _apply_voxel_mask(out.z_next, voxel_mask)
+            out = step_fn(model, z_t, t, t_next, cond,
+                          voxel_mask=voxel_mask, bg_fill=bg_fill, **kwargs)
+            z_t = _apply_voxel_mask(out.z_next, voxel_mask, bg_fill)
 
         return edict(samples=z_t)
 

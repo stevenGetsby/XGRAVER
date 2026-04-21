@@ -5,9 +5,10 @@ __attributes = {
     'FlowMatchingTrainer': 'flow_matching.flow_matching',
     'FlowMatchingCFGTrainer': 'flow_matching.flow_matching',
     'ImageConditionedFlowMatchingCFGTrainer': 'flow_matching.flow_matching',
+    'SparseFlowMultiTokenTrainer': 'flow_matching.feats_matching',
+    'SparseFlowMultiTokenCFGTrainer': 'flow_matching.feats_matching',
     'ImageConditionedSparseFlowMultiTokenCFGTrainer': 'flow_matching.feats_matching',
     'ImageConditionedDirectMaskTrainer': 'flow_matching.direct_mask',
-    'ImageConditionedCascadedFeatsCFGTrainer': 'flow_matching.cascaded_feats',
 }
 
 __submodules = []

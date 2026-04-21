@@ -1,8 +1,17 @@
+"""
+Stage 3 feats trainer (cascaded).
+
+Uses a dilated pred_mask (from Stage-2 output) as a voxel-level mask:
+  voxel_mask = dilate(upsample(pred_submask), k=3, iters=2)
+
+Noise / GT / x_t are hard-filled to `bg_fill` on mask=0 positions so the
+model only has to model UDF inside the mask. Loss uses the 3-band mc/near/far
+recipe + complexity reweighting, evaluated on mask=1 positions only.
+"""
 from typing import *
 import os
 import copy
 import functools
-import time
 
 import numpy as np
 import torch
@@ -21,6 +30,9 @@ from .mixins.image_conditioned import ImageConditionedMixin
 
 
 class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
+    """
+    Stage 3 UDF refinement trainer with cascaded pred_mask.
+    """
 
     def __init__(
         self,
@@ -32,12 +44,10 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         complexity_boost: float = 2.0,
         cond_noise_std: float = 0.0,
         noise_scale: float = 2.0,
-        # Cascaded training: use frozen mask model to predict submask
-        cascade_mask_config: str = "",
-        cascade_mask_weight: str = "",
-        cascade_mask_prob: float = 0.0,
-        cascade_weak_noise_std: float = 0.05,
-        cascade_mask_threshold: float = 0.5,
+        cascade_dilate_iters: int = 2,
+        cascade_dilate_kernel: int = 3,
+        cascade_dilate_mode: str = "cube",
+        gt_clip_max: Optional[float] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -49,44 +59,21 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         self.loss_type = loss_type
         self.noise_scale = noise_scale
         self.voxel = MC_THRESHOLD
-        self.cascade_mask_prob = cascade_mask_prob
-        self.cascade_weak_noise_std = cascade_weak_noise_std
-        self.cascade_mask_threshold = cascade_mask_threshold
-        self._cascade_mask_model = None
 
-        # Load frozen mask model if configured
-        if cascade_mask_config and cascade_mask_weight and cascade_mask_prob > 0:
-            self._init_cascade_mask(cascade_mask_config, cascade_mask_weight)
+        self._cascade_dilate_iters = cascade_dilate_iters
+        self._cascade_dilate_kernel = cascade_dilate_kernel
+        self._cascade_dilate_mode = str(cascade_dilate_mode).lower()
+        assert self._cascade_dilate_mode in ("cube", "cross"), \
+            f"cascade_dilate_mode must be cube|cross, got {cascade_dilate_mode}"
+        self._gt_clip_max = float(gt_clip_max) if gt_clip_max is not None else None
 
-        print(f"[MultiTokenTrainer] loss_type={self.loss_type}, "
+        print(f"[SparseFlowMultiTokenTrainer] loss_type={self.loss_type}, "
               f"λ_flow={lambda_flow}, λ_normal={lambda_normal}, "
-              f"surface_weight={surface_weight}, "
-              f"complexity_boost={complexity_boost}, "
+              f"surface_weight={surface_weight}, complexity_boost={complexity_boost}, "
               f"noise_scale={noise_scale}")
-        if self._cascade_mask_model is not None:
-            print(f"[CascadeTraining] mask_prob={cascade_mask_prob}, "
-                  f"weak_noise_std={cascade_weak_noise_std}, "
-                  f"threshold={cascade_mask_threshold}")
-
-    def _init_cascade_mask(self, config_path: str, weight_path: str):
-        """Load frozen mask model for cascaded training."""
-        import json
-        from ... import models as model_registry
-
-        with open(config_path) as f:
-            cfg = json.load(f)
-        model_cfg = cfg['models']['denoiser']
-        mask_model = getattr(model_registry, model_cfg['name'])(**model_cfg['args'])
-        state_dict = torch.load(weight_path, map_location='cpu', weights_only=True)
-        mask_model.load_state_dict(state_dict, strict=False)
-        mask_model.eval()
-        for p in mask_model.parameters():
-            p.requires_grad_(False)
-        # Will be moved to device on first use
-        self._cascade_mask_model = mask_model
-        n_params = sum(p.numel() for p in mask_model.parameters()) / 1e6
-        print(f"[CascadeTraining] Loaded frozen mask model: {model_cfg['name']} "
-              f"({n_params:.1f}M params) from {weight_path}")
+        print(f"  cascade: dilate mode={self._cascade_dilate_mode}, "
+              f"k={cascade_dilate_kernel}, iters={cascade_dilate_iters}, "
+              f"gt_clip_max={self._gt_clip_max}")
 
     # ------------------------------------------------------------------
     # Dataloader
@@ -126,7 +113,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
     @staticmethod
     def _expand_t_to_tokens(t: torch.Tensor, layout, T: int) -> torch.Tensor:
-        """将 batch-level t [B] 展开为 token-level [T, 1]，纯向量化无 Python 循环。"""
         counts = torch.tensor(
             [sl.stop - sl.start for sl in layout],
             device=t.device, dtype=torch.long,
@@ -151,20 +137,69 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         return super().compute_v_from_x_prediction(x_t, x_pred, t)
 
     # ------------------------------------------------------------------
-    # Selective masking: submask [T, R^3] → per-voxel mask [T, 4096]
+    # Voxel mask: submask [T, R^3] -> dilated [T, D^3]
     # ------------------------------------------------------------------
 
     @staticmethod
     @torch.no_grad()
     def _upsample_submask(submask: torch.Tensor, block_dim: int = BLOCK_DIM) -> torch.Tensor:
-        """将 per-block SUBMASK_RES³ submask 直接上采样到 per-voxel BLOCK_DIM³ hard mask."""
         R = SUBMASK_RES
         T = submask.shape[0]
         sub_3d = submask.reshape(T, 1, R, R, R)
-
         scale = block_dim // R
         voxel_3d = F.interpolate(sub_3d, scale_factor=scale, mode='nearest')
         return voxel_3d.reshape(T, -1)
+
+    @staticmethod
+    @torch.no_grad()
+    def _dilate_voxel_mask(voxel_mask: torch.Tensor,
+                           kernel: int, iters: int) -> torch.Tensor:
+        D = BLOCK_DIM
+        T = voxel_mask.shape[0]
+        vol = voxel_mask.reshape(T, 1, D, D, D).float()
+        pad = kernel // 2
+        for _ in range(iters):
+            vol = F.max_pool3d(vol, kernel_size=kernel, stride=1, padding=pad)
+        return vol.reshape(T, -1)
+
+    _CROSS_KERNEL: Optional[torch.Tensor] = None
+
+    @classmethod
+    def _get_cross_kernel(cls, device, dtype):
+        k = cls._CROSS_KERNEL
+        if k is None or k.device != device or k.dtype != dtype:
+            t = torch.zeros(1, 1, 3, 3, 3, device=device, dtype=dtype)
+            t[0, 0, 1, 1, 1] = 1
+            t[0, 0, 0, 1, 1] = 1; t[0, 0, 2, 1, 1] = 1
+            t[0, 0, 1, 0, 1] = 1; t[0, 0, 1, 2, 1] = 1
+            t[0, 0, 1, 1, 0] = 1; t[0, 0, 1, 1, 2] = 1
+            cls._CROSS_KERNEL = t
+        return cls._CROSS_KERNEL
+
+    @classmethod
+    @torch.no_grad()
+    def _dilate_voxel_mask_cross(cls, voxel_mask: torch.Tensor, iters: int) -> torch.Tensor:
+        """6-邻接膨胀：等价于沿 3 个轴各做 k=3 max_pool3d 后取最大。
+        比 conv3d 实现快 5-10x（max_pool3d 有专用 kernel）。"""
+        D = BLOCK_DIM
+        T = voxel_mask.shape[0]
+        vol = voxel_mask.reshape(T, 1, D, D, D).float()
+        for _ in range(iters):
+            vx = F.max_pool3d(vol, (3, 1, 1), 1, (1, 0, 0))
+            vy = F.max_pool3d(vol, (1, 3, 1), 1, (0, 1, 0))
+            vz = F.max_pool3d(vol, (1, 1, 3), 1, (0, 0, 1))
+            vol = torch.maximum(torch.maximum(vx, vy), vz)
+        return vol.reshape(T, -1)
+
+    def _build_voxel_mask(self, pred_submask: torch.Tensor) -> torch.Tensor:
+        raw = self._upsample_submask(pred_submask)
+        if self._cascade_dilate_iters <= 0:
+            return raw
+        if self._cascade_dilate_mode == "cross":
+            return self._dilate_voxel_mask_cross(raw, self._cascade_dilate_iters)
+        return self._dilate_voxel_mask(
+            raw, self._cascade_dilate_kernel, self._cascade_dilate_iters,
+        )
 
     # ------------------------------------------------------------------
     # Normal loss (UDF 梯度方向一致性)
@@ -172,7 +207,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
     @staticmethod
     def _grad_3d(vol: torch.Tensor) -> torch.Tensor:
-        """Central differences on [N, 1, D, D, D] → [N, 3, D, D, D]"""
         vp = F.pad(vol, (1, 1, 1, 1, 1, 1), mode='replicate')
         gx = vp[:, :, 2:, 1:-1, 1:-1] - vp[:, :, :-2, 1:-1, 1:-1]
         gy = vp[:, :, 1:-1, 2:, 1:-1] - vp[:, :, 1:-1, :-2, 1:-1]
@@ -181,52 +215,47 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
     def _normal_loss(self, pred_feats: torch.Tensor, gt_feats: torch.Tensor) -> torch.Tensor:
         D = BLOCK_DIM
-        T = pred_feats.shape[0]
         v = self.voxel
 
-        # === 筛选含表面的 block: any(UDF < 2v) per block ===
         with torch.no_grad():
-            surface_mask = (gt_feats < v * 2).any(dim=1)     # [T] bool
+            surface_mask = (gt_feats < v * 2).any(dim=1)
         T_surface = surface_mask.sum().item()
         if T_surface == 0:
             return torch.tensor(0.0, device=pred_feats.device)
 
-        # 只取含表面的 block
-        pred_surface = pred_feats[surface_mask]               # [T_s, D³]
-        gt_surface = gt_feats[surface_mask]                   # [T_s, D³]
+        pred_surface = pred_feats[surface_mask]
+        gt_surface = gt_feats[surface_mask]
 
         pred_vol = pred_surface.reshape(T_surface, 1, D, D, D)
-        pred_grad = self._grad_3d(pred_vol)                  # [T_s, 3, D, D, D]
+        pred_grad = self._grad_3d(pred_vol)
 
         with torch.no_grad():
             gt_vol = gt_surface.reshape(T_surface, 1, D, D, D)
             gt_grad = self._grad_3d(gt_vol)
             gt_norm = gt_grad.norm(dim=1, keepdim=True).clamp(min=1e-4)
-            gt_dir = gt_grad / gt_norm                       # [T_s, 3, D, D, D]
+            gt_dir = gt_grad / gt_norm
 
-            # MC 插值区 (< 2 voxels): 法线只在此处影响 mesh 质量
-            w = (gt_surface < v * 2).float()                  # 二值 mask
+            w = (gt_surface < v * 2).float()
             w_3d = w.reshape(T_surface, 1, D, D, D)
 
         pred_norm = pred_grad.norm(dim=1, keepdim=True).clamp(min=1e-4)
         pred_dir = pred_grad / pred_norm
 
-        # 1. 方向一致性 (Cosine Similarity)
-        cos_sim = (pred_dir * gt_dir).sum(dim=1, keepdim=True)  # [T_s, 1, D, D, D]
+        cos_sim = (pred_dir * gt_dir).sum(dim=1, keepdim=True)
         dir_loss = (1.0 - cos_sim) * w_3d
-
-        # 2. Eikonal Loss (UDF 梯度模长必须为 1)
         eikonal_loss = (pred_norm - 1.0).abs() * w_3d
 
-        # 3. Edge-aware weighting: 高曲率区域(法线变化大)加权更高
         with torch.no_grad():
-            gt_laplacian = self._grad_3d(gt_norm)  # 梯度模长的梯度 → 曲率代理
+            gt_laplacian = self._grad_3d(gt_norm)
             curvature = gt_laplacian.norm(dim=1, keepdim=True)
-            edge_w = 1.0 + 2.0 * (curvature / curvature.max().clamp(min=1e-6))  # [1, 3]
+            edge_w = 1.0 + 2.0 * (curvature / curvature.max().clamp(min=1e-6))
 
         loss = (dir_loss + 0.5 * eikonal_loss) * edge_w
-
         return loss.mean()
+
+    # ------------------------------------------------------------------
+    # Complexity reweighting
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _neighborhood_complexity(
@@ -237,38 +266,32 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         voxel: float,
         boost: float,
     ) -> torch.Tensor:
-        """
-        邻域曲率复杂度: 连通 block 间曲率变化越剧烈 → 权重越大.
-        复杂几何 (耳朵、手指、褶皱) = 多个邻近 block 曲率急变的区域.
-        """
         D = BLOCK_DIM
         T = gt_feats.shape[0]
         device = gt_feats.device
 
-        # 1. Per-block curvature: 表面体素内梯度模长的标准差
-        surface_mask = (gt_feats < voxel * 2).any(dim=1)  # [T]
+        surface_mask = (gt_feats < voxel * 2).any(dim=1)
         block_curvature = torch.zeros(T, device=device)
         T_s = surface_mask.sum().item()
 
         if T_s > 0:
             gt_vol = gt_feats[surface_mask].reshape(T_s, 1, D, D, D)
             grad = self._grad_3d(gt_vol)
-            grad_norm = grad.norm(dim=1).reshape(T_s, -1)  # [T_s, D³]
-            w = (gt_feats[surface_mask] < voxel * 2).float()  # [T_s, D³]
+            grad_norm = grad.norm(dim=1).reshape(T_s, -1)
+            w = (gt_feats[surface_mask] < voxel * 2).float()
             w_sum = w.sum(dim=1).clamp(min=1)
             mean_gn = (grad_norm * w).sum(dim=1) / w_sum
             var_gn = ((grad_norm - mean_gn.unsqueeze(1)).pow(2) * w).sum(dim=1) / w_sum
             block_curvature[surface_mask] = var_gn.sqrt()
 
-        # 2. 邻域曲率梯度: 6-连通邻居间曲率差异 (纯 GPU 向量化)
         complexity = torch.zeros(T, device=device)
         offsets = torch.tensor(
             [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
             device=device, dtype=torch.long,
-        )  # [6, 3]
+        )
 
         for b, sl in enumerate(layout):
-            bc = coords[sl][:, 1:].long()  # [N_b, 3]
+            bc = coords[sl][:, 1:].long()
             curv = block_curvature[sl]
             is_surf = surface_mask[sl]
             N_b = bc.shape[0]
@@ -276,39 +299,31 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                 complexity[sl] = curv
                 continue
 
-            # GPU hash: 所有 block 坐标 → 唯一 key
             P1, P2 = 100003, 1009
-            keys = bc[:, 0] * P1 + bc[:, 1] * P2 + bc[:, 2]  # [N_b]
+            keys = bc[:, 0] * P1 + bc[:, 1] * P2 + bc[:, 2]
 
-            # 6 个方向的邻居 key: [N_b, 6]
-            nb_coords = bc.unsqueeze(1) + offsets.unsqueeze(0)  # [N_b, 6, 3]
+            nb_coords = bc.unsqueeze(1) + offsets.unsqueeze(0)
             nb_keys = (nb_coords[:, :, 0] * P1
                        + nb_coords[:, :, 1] * P2
-                       + nb_coords[:, :, 2])  # [N_b, 6]
+                       + nb_coords[:, :, 2])
 
-            # GPU hash table lookup via sorting
-            # 合并所有 key, 用 searchsorted 做向量化查找
             sorted_keys, sort_idx = keys.sort()
-            # 在排序后的 keys 中查找邻居
-            flat_nb = nb_keys.reshape(-1)  # [N_b * 6]
+            flat_nb = nb_keys.reshape(-1)
             pos = torch.searchsorted(sorted_keys, flat_nb)
             pos = pos.clamp(max=N_b - 1)
-            # 验证是否真的匹配
             matched = sorted_keys[pos] == flat_nb
-            # 映射回原始 index
-            nb_idx_flat = sort_idx[pos]  # 原始空间中的 index
-            nb_idx_flat[~matched] = 0    # 无效位置用 0 (安全索引)
+            nb_idx_flat = sort_idx[pos]
+            nb_idx_flat[~matched] = 0
 
-            nb_idx = nb_idx_flat.reshape(N_b, 6)     # [N_b, 6]
-            valid = matched.reshape(N_b, 6)           # [N_b, 6]
+            nb_idx = nb_idx_flat.reshape(N_b, 6)
+            valid = matched.reshape(N_b, 6)
 
-            # 邻居曲率 + 表面判断
-            nb_curv = curv[nb_idx]                    # [N_b, 6]
-            nb_is_surf = is_surf[nb_idx]              # [N_b, 6]
-            valid_surf = valid & nb_is_surf           # [N_b, 6]
+            nb_curv = curv[nb_idx]
+            nb_is_surf = is_surf[nb_idx]
+            valid_surf = valid & nb_is_surf
 
             curv_diff = (curv.unsqueeze(1) - nb_curv).abs() * valid_surf.float()
-            n_surf_nb = valid_surf.float().sum(dim=1)  # [N_b]
+            n_surf_nb = valid_surf.float().sum(dim=1)
 
             has_nb = n_surf_nb > 0
             mean_diff = torch.where(
@@ -316,11 +331,9 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                 torch.zeros_like(n_surf_nb),
             )
 
-            # 复杂度 = 自身曲率 + 邻域曲率变化, 再按邻居密度放大
             local_c = (curv + mean_diff) * (1.0 + n_surf_nb / 6.0)
             complexity[sl] = local_c
 
-        # Normalize → [1, 1 + boost]
         cmax, cmin = complexity.max(), complexity.min()
         if cmax > cmin:
             complexity = (complexity - cmin) / (cmax - cmin)
@@ -330,7 +343,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         return 1.0 + boost * complexity
 
     # ------------------------------------------------------------------
-    # Training losses
+    # Training losses (cascade: pred_mask dilate + hard-fill)
     # ------------------------------------------------------------------
 
     def training_losses(
@@ -339,6 +352,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         x_c: sp.SparseTensor = None,
         cond=None,
         submask=None,
+        pred_submask=None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
         x = x_f if x_f is not None else x_c
@@ -349,148 +363,110 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         device = x.device
         terms = edict()
 
-        _profile = os.environ.get('XGRAVER_PROFILE', '0') == '1'
-        if _profile:
-            torch.cuda.synchronize()
-            _t0 = time.time()
-
         cond = self.get_cond(cond, **kwargs)
-
-        # 条件噪声增强: 训练时给 DINOv2 特征加微弱噪声, 防止过拟合
         if self.cond_noise_std > 0:
             cond = cond + self.cond_noise_std * torch.randn_like(cond)
 
-        if _profile:
-            torch.cuda.synchronize()
-            _t_cond = time.time() - _t0
+        v = self.voxel
 
         with torch.no_grad():
-            noise_raw = self.noise_scale * torch.randn_like(x.feats)
-
-            # Selective masking: submask=0 的位置不加噪, 确定性填 1.0
-            if submask is not None:
-                submask = submask.to(device)
-                voxel_mask = self._upsample_submask(submask)  # [T, 4096]
-                # mask=0 的位置: noise=0, GT 强制=1.0
-                noise_raw = noise_raw * voxel_mask
-                # 强制 GT 远场区域为 1.0 (和 mask 一致)
-                x_feats_masked = x.feats * voxel_mask + (1.0 - voxel_mask) * 1.0
-                x_masked = x.replace(x_feats_masked)
+            # Build dilated voxel mask from pred_submask (fallback: GT submask, fallback: all-ones)
+            if pred_submask is not None:
+                pred_sub = pred_submask.to(device)
+            elif submask is not None:
+                pred_sub = submask.to(device)
             else:
-                voxel_mask = None
-                x_masked = x
+                pred_sub = torch.ones(T, SUBMASK_RES ** 3, device=device)
+            voxel_mask = self._build_voxel_mask(pred_sub)
 
+            # GT clip (optional) + hard-fill on mask=0
+            bg_fill = self._gt_clip_max if self._gt_clip_max is not None else 1.0
+            if self._gt_clip_max is not None:
+                gt = x.feats.clamp(max=self._gt_clip_max)
+            else:
+                gt = x.feats
+            x_feats_masked = gt * voxel_mask + (1.0 - voxel_mask) * bg_fill
+            x_masked = x.replace(x_feats_masked)
+
+            noise_raw = self.noise_scale * torch.randn_like(x.feats) * voxel_mask
             noise = x.replace(noise_raw)
             t = self.sample_t(B).to(device).float()
             x_t = self.diffuse(x_masked, t, noise=noise)
+            x_t_feats = x_t.feats * voxel_mask + (1.0 - voxel_mask) * bg_fill
+            x_t = x_t.replace(x_t_feats)
 
-            # mask=0 的位置: x_t 强制 = 1.0 (确保模型看到的远场是确定性的)
-            if voxel_mask is not None:
-                x_t_feats = x_t.feats * voxel_mask + (1.0 - voxel_mask) * 1.0
-                x_t = x_t.replace(x_t_feats)
+        pred = self.training_models["denoiser"](x_t, t, cond)
 
-        if _profile:
-            torch.cuda.synchronize()
-            _t_prep = time.time() - _t0 - _t_cond
-
-        pred = self.training_models["denoiser"](x_t, t, cond, submask=submask)
-
-        if _profile:
-            torch.cuda.synchronize()
-            _t_fwd = time.time() - _t0 - _t_cond - _t_prep
-
-        # 模型直接在原始 UDF [0,1] 空间预测 x_0
         x_residual = pred.feats - x_masked.feats
-        v = self.voxel
-
         t_per_token = self._expand_t_to_tokens(t, x.layout, T)
 
         if self.loss_type == "v_loss":
             v_denom = (1 - t_per_token).clamp(min=0.05)
-            v_residual = x_residual / v_denom
-            diff = v_residual ** 2
+            diff = (x_residual / v_denom) ** 2
         else:
             diff = x_residual ** 2
 
-        # Selective masking: mask=0 的位置不参与 loss
-        if voxel_mask is not None:
-            diff = diff * voxel_mask
+        diff = diff * voxel_mask
 
         with torch.no_grad():
-            mc_mask   = x_masked.feats < v * 2
-            far_mask  = x_masked.feats > v * 3
-            near_mask = ~mc_mask & ~far_mask
+            mc_mask   = (x_masked.feats < v * 2).float()
+            far_mask  = (x_masked.feats > v * 3).float()
+            near_mask = (1.0 - mc_mask) * (1.0 - far_mask)
 
-        mc_f   = mc_mask.float()
-        near_f = near_mask.float()
-        far_f  = far_mask.float()
-
-        block_loss_mc = (diff * mc_f).sum(dim=1) / mc_f.sum(dim=1).clamp(min=1)
-        block_loss_near = (diff * near_f).sum(dim=1) / near_f.sum(dim=1).clamp(min=1)
-        block_loss_far  = (diff * far_f).sum(dim=1) / far_f.sum(dim=1).clamp(min=1)
+        block_loss_mc   = (diff * mc_mask  ).sum(dim=1) / mc_mask  .sum(dim=1).clamp(min=1)
+        block_loss_near = (diff * near_mask).sum(dim=1) / near_mask.sum(dim=1).clamp(min=1)
+        block_loss_far  = (diff * far_mask ).sum(dim=1) / far_mask .sum(dim=1).clamp(min=1)
 
         block_loss = (
             self.surface_weight * block_loss_mc
-            + 3.0 * block_loss_near
+            + 2.0 * block_loss_near
             + 1.0 * block_loss_far
         )
 
-        # Complexity reweighting: 连通 block 曲率变化越陡峭 → 权重越大
         with torch.no_grad():
             complexity_w = self._neighborhood_complexity(
                 x_masked.feats, x.coords, x.layout,
                 self.voxel, self.complexity_boost,
             )
-
         block_loss = block_loss * complexity_w
 
-        # Per-sample 归一化: 每个样本贡献等权, 避免大 token 数样本主导梯度
-        per_sample_loss = torch.stack([
-            block_loss[sl].mean() for sl in x.layout
-        ])
+        per_sample_loss = torch.stack([block_loss[sl].mean() for sl in x.layout])
         terms["flow_loss"] = per_sample_loss.mean()
         terms["complexity_avg"] = complexity_w.mean()
 
-        per_sample_mc   = torch.stack([block_loss_mc[sl].mean() for sl in x.layout])
+        per_sample_mc   = torch.stack([block_loss_mc[sl].mean()   for sl in x.layout])
         per_sample_near = torch.stack([block_loss_near[sl].mean() for sl in x.layout])
-        per_sample_far  = torch.stack([block_loss_far[sl].mean() for sl in x.layout])
+        per_sample_far  = torch.stack([block_loss_far[sl].mean()  for sl in x.layout])
         terms["loss_mc"]   = per_sample_mc.mean()
         terms["loss_near"] = per_sample_near.mean()
         terms["loss_far"]  = per_sample_far.mean()
 
         terms["loss"] = self.lambda_flow * terms["flow_loss"]
 
-        # Normal Loss (default off; 建议 flow_loss 收敛后再开)
         if self.lambda_normal > 0:
             terms["normal_loss"] = self._normal_loss(pred.feats, x_masked.feats)
             terms["loss"] = terms["loss"] + self.lambda_normal * terms["normal_loss"]
 
-        # 按 t 分桶监控: 诊断哪个时间区间卡住
         with torch.no_grad():
-            # block_loss 是 per-token [T], 先聚合为 per-batch [B]
-            batch_loss = torch.stack([
-                block_loss[sl].mean() for sl in x.layout
-            ])
+            batch_loss = torch.stack([block_loss[sl].mean() for sl in x.layout])
             for lo, hi in [(0.0, 0.3), (0.3, 0.7), (0.7, 1.0)]:
-                mask = (t >= lo) & (t < hi)
-                if mask.any():
-                    terms[f"loss_t{lo:.1f}_{hi:.1f}"] = batch_loss[mask].mean()
+                mt = (t >= lo) & (t < hi)
+                if mt.any():
+                    terms[f"loss_t{lo:.1f}_{hi:.1f}"] = batch_loss[mt].mean()
 
-        if _profile:
-            torch.cuda.synchronize()
-            _t_loss = time.time() - _t0 - _t_cond - _t_prep - _t_fwd
-            _t_total = time.time() - _t0
-            print(f"  [Profile] tokens={T} | "
-                  f"cond={_t_cond*1000:.1f}ms "
-                  f"prep={_t_prep*1000:.1f}ms "
-                  f"fwd={_t_fwd*1000:.1f}ms "
-                  f"loss={_t_loss*1000:.1f}ms "
-                  f"total={_t_total*1000:.1f}ms")
+            terms["mask_ratio"] = float(voxel_mask.mean())
+            if submask is not None and pred_submask is not None:
+                gt_voxel = self._upsample_submask(submask.to(device))
+                gt_b = gt_voxel > 0.5
+                dil_b = voxel_mask > 0.5
+                gt_total = gt_b.sum().clamp(min=1)
+                terms["gt_recall"] = float((gt_b & dil_b).sum() / gt_total)
+                terms["deep_fn_ratio"] = float((gt_b & ~dil_b).sum() / gt_total)
 
         return terms, {}
 
     # ------------------------------------------------------------------
-    # 合成大图: 每 16 张法线图 → 4×4 overview
+    # Snapshot helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -503,7 +479,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
         details_dir = os.path.join(normalmap_dir, "details")
 
-        # 收集 pred / gt 法线图 (从 details/ 子目录读取)
         pred_paths, gt_paths = [], []
         for i in range(num_samples):
             p = os.path.join(details_dir, f"sample_{i:03d}_normal.jpg")
@@ -512,7 +487,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             gt_paths.append(g if os.path.exists(g) else None)
 
         def compose_grid(paths, tag):
-            """每 16 张拼 4×4"""
             for g_idx in range(0, len(paths), 16):
                 group = paths[g_idx : g_idx + 16]
                 imgs = []
@@ -528,11 +502,9 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                 if not any(imgs):
                     continue
 
-                # 取分辨率 (以第一张有效图为准)
                 ref = next(im for im in imgs if im is not None)
                 w, h = ref.size
 
-                # 补齐: 不足 16 张用黑图占位
                 while len(imgs) < 16:
                     imgs.append(None)
                 imgs = [
@@ -540,7 +512,6 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                     for im in imgs
                 ]
 
-                # 4列 × 4行
                 grid = Image.new("RGB", (w * 4, h * 4))
                 for row in range(4):
                     for col in range(4):
@@ -556,8 +527,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         compose_grid(gt_paths, "gt")
 
     # ------------------------------------------------------------------
-    # Snapshot: 推理 + 转 mesh + 渲染法线图 (所有卡参与, 全并行)
-    # 覆写 base.snapshot(), 不走 dense tensor 可视化路径
+    # Snapshot (cascade: dilated pred mask + hard-fill, same as training)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -580,7 +550,8 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             os.makedirs(details_dir, exist_ok=True)
             if verbose:
                 print(f"\n[Snapshot] Step {self.step}: "
-                      f"{num_samples} samples, {self.world_size} GPUs")
+                      f"{num_samples} samples, {self.world_size} GPUs "
+                      f"({self._cascade_dilate_mode}_{self._cascade_dilate_iters}x + hard-fill)")
 
         if self.world_size > 1:
             dist.barrier()
@@ -590,20 +561,12 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             m.eval()
 
         try:
-            # 优先使用 test_dataset (固定测试集), 否则 fallback 到训练集
             if hasattr(self, 'test_dataset') and self.test_dataset is not None:
                 snap_dataset = self.test_dataset
-                if verbose:
-                    print(f"  Using test_dataset ({len(snap_dataset)} samples)")
             else:
                 snap_dataset = copy.deepcopy(self.dataset)
-                if verbose:
-                    print(f"  Using train dataset (deepcopy, {len(snap_dataset)} samples)")
             dataloader = DataLoader(
-                snap_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=0,
+                snap_dataset, batch_size=batch_size, shuffle=True, num_workers=0,
                 collate_fn=getattr(snap_dataset, "collate_fn", None),
             )
 
@@ -613,19 +576,15 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
             my_count = max(0, my_end - my_start)
 
             sampler = self.get_sampler()
-            model = getattr(
-                self.models["denoiser"], "module", self.models["denoiser"],
-            )
+            model = getattr(self.models["denoiser"], "module", self.models["denoiser"])
 
             amp_dtype = torch.float16
-            use_amp = (
-                hasattr(self, 'accelerator')
-                and self.accelerator.mixed_precision != 'no'
-            )
+            use_amp = (hasattr(self, 'accelerator')
+                       and self.accelerator.mixed_precision != 'no')
 
             data_iter = iter(dataloader)
             saved = 0
-            tmp_mesh_paths = []  # 临时 ply 路径, 渲染后删除
+            tmp_mesh_paths = []
 
             while saved < my_count:
                 try:
@@ -642,42 +601,47 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                 x_f = data.pop("x_f", None)
                 data.pop("n_f", None)
                 snap_submask = data.pop("submask", None)
+                snap_pred_submask = data.pop("pred_submask", None)
                 x_gt = x_f if x_f is not None else x_c
 
-                noise_raw = self.noise_scale * torch.randn_like(x_gt.feats)
-
-                # Selective masking: mask=0 位置不加噪, 初始值 = 1.0
-                if snap_submask is not None:
-                    snap_submask = snap_submask.cuda()
-                    snap_voxel_mask = self._upsample_submask(snap_submask)
-                    noise_raw = noise_raw * snap_voxel_mask
-                    # 初始噪声中 mask=0 → 1.0
-                    noise_raw = noise_raw + (1.0 - snap_voxel_mask) * 1.0
-                    noise = x_gt.replace(noise_raw)
+                if snap_pred_submask is not None:
+                    voxel_mask = self._build_voxel_mask(snap_pred_submask.cuda())
+                elif snap_submask is not None:
+                    voxel_mask = self._build_voxel_mask(snap_submask.cuda())
                 else:
-                    snap_voxel_mask = None
-                    noise = x_gt.replace(noise_raw)
+                    voxel_mask = torch.ones_like(x_gt.feats)
+
+                noise_raw = self.noise_scale * torch.randn_like(x_gt.feats)
+                noise_raw = noise_raw * voxel_mask
+                # Hard-fill mask=0 to bg_fill so the first model forward matches training.
+                bg_fill_init = self._gt_clip_max if self._gt_clip_max is not None else 1.0
+                noise_raw = noise_raw + (1.0 - voxel_mask) * bg_fill_init
+                noise = x_gt.replace(noise_raw)
 
                 args = self.get_inference_cond(**data)
-                # 把 submask 传给模型, voxel_mask 传给 sampler
-                if snap_submask is not None:
-                    args['submask'] = snap_submask
-                    args['voxel_mask'] = snap_voxel_mask
+                args['voxel_mask'] = voxel_mask
+                if self._gt_clip_max is not None:
+                    args['bg_fill'] = self._gt_clip_max
 
                 with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                     res = sampler.sample(
                         model, noise=noise, **args,
                         steps=steps, cfg_strength=cfg_strength,
                         cfg_interval=cfg_interval,
-                        use_heun=True,
-                        verbose=False,
+                        use_heun=True, verbose=False,
                     )
                     pred = res.samples
 
-                # 推理后 mask=0 位置强制 = 1.0
-                if snap_voxel_mask is not None:
-                    pred_feats = pred.feats * snap_voxel_mask + (1.0 - snap_voxel_mask) * 1.0
-                    pred = pred.replace(pred_feats)
+                bg_fill = self._gt_clip_max if self._gt_clip_max is not None else 1.0
+                clamp_hi = self._gt_clip_max if self._gt_clip_max is not None else 1.0
+                pred_feats = pred.feats * voxel_mask + (1.0 - voxel_mask) * bg_fill
+                pred_feats = pred_feats.clamp(0.0, clamp_hi)
+                pred = pred.replace(pred_feats)
+
+                if snap_submask is not None:
+                    snap_gt_voxel = self._upsample_submask(snap_submask.cuda())
+                else:
+                    snap_gt_voxel = None
 
                 actual_batch = len(x_gt.layout)
                 for b in range(min(actual_batch, my_count - saved)):
@@ -687,15 +651,46 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
                     gt_coords = x_gt.coords[sl].cpu().numpy()
                     pred_fine = pred.feats[sl].cpu().float().numpy()
-                    gt_fine_np = None
-                    if x_f is not None:
-                        gt_fine_np = x_f.feats[sl].cpu().numpy()
+                    gt_fine_np = x_f.feats[sl].cpu().numpy() if x_f is not None else None
 
-                    # -- Pred: 转临时 mesh → 渲染法线图 → 删 mesh --
+                    try:
+                        diag = {}
+                        pf = pred.feats[sl].cpu().float()
+                        vm = voxel_mask[sl].cpu().float()
+
+                        diag['num_tokens'] = int(pf.shape[0])
+                        diag['mask_ratio'] = float(vm.mean())
+
+                        surf_b = vm > 0.5
+                        far_b = ~surf_b
+                        for region, rmask in [('surf', surf_b), ('far', far_b)]:
+                            vals = pf[rmask]
+                            if vals.numel() > 0:
+                                diag[f'{region}_mean'] = float(vals.mean())
+                                diag[f'{region}_std'] = float(vals.std())
+                                diag[f'{region}_below_mc'] = float(
+                                    (vals < MC_THRESHOLD).float().mean())
+                                diag[f'{region}_num'] = int(rmask.sum())
+
+                        if snap_gt_voxel is not None:
+                            gm = snap_gt_voxel[sl].cpu().float()
+                            gt_b = gm > 0.5
+                            diag['gt_total'] = int(gt_b.sum())
+                            gt_covered = int((surf_b & gt_b).sum())
+                            diag['gt_recall'] = gt_covered / max(diag['gt_total'], 1)
+                            deep_fn = (~surf_b & gt_b)
+                            diag['deep_fn_num'] = int(deep_fn.sum())
+                            diag['deep_fn_ratio'] = diag['deep_fn_num'] / max(diag['gt_total'], 1)
+
+                        import json
+                        with open(os.path.join(details_dir, f"{name}_diag.json"), 'w') as f:
+                            json.dump(diag, f, indent=2)
+                    except Exception as e:
+                        print(f"  [Rank {self.rank}] Diag error ({name}): {e}")
+
                     tmp_ply = os.path.join(details_dir, f"{name}_tmp.ply")
                     normal_path = os.path.join(details_dir, f"{name}_normal.jpg")
                     pred_clipped = np.clip(pred_fine, 0.0, 1.0)
-
                     try:
                         torch.cuda.empty_cache()
                         self.dataset.tokens_to_mesh(gt_coords, pred_clipped, tmp_ply, verbose=False)
@@ -707,21 +702,17 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                         tmp_mesh_paths.append(tmp_ply)
                         try:
                             self.dataset.render_normal_grid(
-                                tmp_ply, normal_path,
-                                resolution=1024, radius=1.75,
-                                verbose=False,
-                            )
+                                tmp_ply, normal_path, resolution=1024,
+                                radius=1.75, verbose=False)
                         except Exception as e:
                             print(f"  [Rank {self.rank}] Render error ({name}): {e}")
                             torch.cuda.synchronize()
                             torch.cuda.empty_cache()
 
-                    # -- GT: 转临时 mesh → 渲染法线图 → 删 mesh --
                     if gt_fine_np is not None:
                         gt_tmp_ply = os.path.join(details_dir, f"{name}_gt_tmp.ply")
                         gt_normal_path = os.path.join(details_dir, f"{name}_gt_normal.jpg")
                         gt_clipped = np.clip(gt_fine_np, 0.0, 1.0)
-
                         try:
                             torch.cuda.empty_cache()
                             self.dataset.tokens_to_mesh(gt_coords, gt_clipped, gt_tmp_ply, verbose=False)
@@ -733,10 +724,8 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                             tmp_mesh_paths.append(gt_tmp_ply)
                             try:
                                 self.dataset.render_normal_grid(
-                                    gt_tmp_ply, gt_normal_path,
-                                    resolution=1024, radius=1.75,
-                                    verbose=False,
-                                )
+                                    gt_tmp_ply, gt_normal_path, resolution=1024,
+                                    radius=1.75, verbose=False)
                             except Exception as e:
                                 print(f"  [Rank {self.rank}] GT render error ({name}): {e}")
                                 torch.cuda.synchronize()
@@ -746,23 +735,47 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
                         print(f"  [Rank {self.rank}] Sampling {saved+1}/{my_count}")
                     saved += 1
 
-            # 清理临时 ply
             for p in tmp_mesh_paths:
                 try:
                     os.remove(p)
                 except OSError:
                     pass
 
-            # 同步
             if self.world_size > 1:
                 dist.barrier()
 
-            # 合成大图
             if self.is_master:
                 self._compose_normal_overviews(snapshot_dir, num_samples, verbose)
-
-            if self.is_master and verbose:
-                print(f"  [Snapshot] All {num_samples} samples done")
+                try:
+                    import json
+                    import glob
+                    diag_files = sorted(glob.glob(os.path.join(details_dir, "*_diag.json")))
+                    if diag_files:
+                        all_diags = []
+                        for df in diag_files:
+                            with open(df) as f:
+                                all_diags.append(json.load(f))
+                        summary = {"num_samples": len(all_diags)}
+                        keys_to_avg = [
+                            'mask_ratio', 'gt_recall', 'deep_fn_ratio',
+                            'surf_mean', 'surf_below_mc',
+                            'far_mean', 'far_below_mc',
+                        ]
+                        for k in keys_to_avg:
+                            vals = [d[k] for d in all_diags if k in d]
+                            if vals:
+                                summary[k] = round(sum(vals) / len(vals), 4)
+                        for k in ['gt_total', 'deep_fn_num', 'surf_num', 'far_num']:
+                            vals = [d[k] for d in all_diags if k in d]
+                            if vals:
+                                summary[k] = sum(vals)
+                        with open(os.path.join(snapshot_dir, "diag_summary.json"), 'w') as f:
+                            json.dump(summary, f, indent=2)
+                        print(f"  [Snapshot] Diagnostics: {summary}")
+                except Exception as e:
+                    print(f"  [Snapshot] Diag summary error: {e}")
+                if verbose:
+                    print(f"  [Snapshot] All {num_samples} samples done")
 
         finally:
             for n, m in self.models.items():
@@ -770,7 +783,7 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
 
 
 # ======================================================================
-# CFG / ImageConditioned 变体
+# CFG / ImageConditioned variants
 # ======================================================================
 
 class SparseFlowMultiTokenCFGTrainer(

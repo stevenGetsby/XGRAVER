@@ -26,17 +26,31 @@ class BlockFeats(StandardDatasetBase):
         min_block_num: int = 0,
         min_aesthetic_score: float = 5.0,
         max_samples: int = 0,
+        pred_mask_dir: str = '',
+        require_pred_mask: bool = False,
     ):
         self.max_block_num = max_block_num
         self.min_block_num = min_block_num
         self.min_aesthetic_score = min_aesthetic_score
         self.max_samples = max_samples
+        self.pred_mask_dir = pred_mask_dir
+        self.require_pred_mask = require_pred_mask
 
         super().__init__(roots)
         self.filter_existing_instances(
             lambda root, instance: os.path.exists(os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')),
             stat_name='npz exists',
         )
+
+        if self.require_pred_mask:
+            before = len(self.instances)
+            self.filter_existing_instances(
+                lambda root, instance: self._has_pred_mask(root, instance),
+                stat_name='pred_mask available',
+            )
+            after = len(self.instances)
+            print(f'  [BlockFeats] pred_mask required (legacy dir={pred_mask_dir or "none"}), '
+                  f'filtered {before} -> {after}')
 
         if self.max_samples > 0 and len(self.instances) > self.max_samples:
             self.instances = self.instances[:self.max_samples]
@@ -48,6 +62,20 @@ class BlockFeats(StandardDatasetBase):
         ]
         if self.max_samples > 0:
             print(f'  [Dataset] max_samples={self.max_samples}, actual={len(self.instances)}')
+
+    def _has_pred_mask(self, root, instance):
+        npz_path = os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')
+        if os.path.exists(npz_path):
+            try:
+                with np.load(npz_path) as data:
+                    if 'pred_mask' in data.files:
+                        return True
+            except Exception:
+                pass
+        if self.pred_mask_dir:
+            if os.path.exists(os.path.join(self.pred_mask_dir, f'{instance}.npy')):
+                return True
+        return False
 
     def filter_metadata(self, metadata):
         stats = {}
@@ -117,10 +145,26 @@ class BlockFeats(StandardDatasetBase):
             else:
                 submask = torch.ones(coords.shape[0], SUBMASK_DIM)
 
+            # per-block pred sub-mask (来自 Stage2 mask 模型缓存; 无则用 GT 作为回退)
+            pred = None
+            if 'pred_mask' in data.files:
+                pred = data['pred_mask']
+
+        if pred is None and self.pred_mask_dir:
+            legacy_path = os.path.join(self.pred_mask_dir, f'{instance}.npy')
+            if os.path.exists(legacy_path):
+                pred = np.load(legacy_path)
+
+        if pred is None:
+            pred_submask = submask.clone()
+        else:
+            pred_submask = torch.from_numpy(pred.astype(np.float32))
+
         return {
             'coords': coords,
             'fine_feats': fine_feats,
             'submask': submask,
+            'pred_submask': pred_submask,
         }
 
     # ------------------------------------------------------------------
@@ -374,6 +418,7 @@ class BlockFeats(StandardDatasetBase):
             coords_list = []
             fine_list = []
             submask_list = []
+            pred_submask_list = []
             layout = []
             start = 0
 
@@ -386,6 +431,8 @@ class BlockFeats(StandardDatasetBase):
                 fine_list.append(b['fine_feats'])
                 if 'submask' in b:
                     submask_list.append(b['submask'])
+                if 'pred_submask' in b:
+                    pred_submask_list.append(b['pred_submask'])
                 layout.append(slice(start, start + n_blocks))
                 start += n_blocks
 
@@ -399,11 +446,12 @@ class BlockFeats(StandardDatasetBase):
                 layout=layout,
             )
 
-            # per-block sub-mask: [T, 8], 和 feats 同维度对齐
             if submask_list:
                 pack['submask'] = torch.cat(submask_list, dim=0)
+            if pred_submask_list:
+                pack['pred_submask'] = torch.cat(pred_submask_list, dim=0)
 
-            exclude_keys = {'coords', 'fine_feats', 'submask'}
+            exclude_keys = {'coords', 'fine_feats', 'submask', 'pred_submask'}
             other_keys = [k for k in sub_batch[0].keys() if k not in exclude_keys]
 
             for k in other_keys:

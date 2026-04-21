@@ -5,7 +5,7 @@
             "args": {
                 "resolution": 0,
                 "bottleneck_dim": 128,
-                "submask_resolution": 4,
+                "submask_resolution": 0,
                 "model_channels": 768,
                 "cond_channels": 1024,
                 "num_blocks": 12,
@@ -18,7 +18,7 @@
                 "use_fp16": true,
                 "qk_rms_norm": true,
                 "qk_rms_norm_cross": true,
-                "use_checkpoint": true,
+                "use_checkpoint": false,
                 "num_context_registers": 32,
                 "context_start_block": 0
             }
@@ -28,36 +28,41 @@
         "name": "ImageConditionedBlockFeats",
         "args": {
             "roots": [
-                "/mnt/data/yizhao/TRAIN"
+                "/cfs/yizhao/TRAIN"
             ],
-            "max_block_num": 7000,
+            "max_block_num": 12000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 1000
+            "max_samples": 0,
+            "require_pred_mask": true
         }
     },
     "test_dataset": {
         "name": "ImageConditionedBlockFeats",
         "args": {
             "roots": [
-                 "/mnt/data/yizhao/TRAIN"
+                "/cfs/yizhao/TRAIN"
             ],
-            "max_block_num": 7000,
+            "max_block_num": 12000,
             "min_aesthetic_score": 0.0,
-            "max_samples": 1000
+            "max_samples": 0,
+            "require_pred_mask": true
         }
     },
     "trainer": {
         "name": "ImageConditionedSparseFlowMultiTokenCFGTrainer",
         "args": {
-            "max_steps": 400000,
+            "max_steps": 100000,
             "batch_size_per_gpu": 2,
             "batch_split": 1,
             "noise_scale": 2.0,
             "loss_type": "v_loss",
             "lambda_normal": 0.1,
-            "surface_weight": 8.0,
+            "surface_weight": 10.0,
             "complexity_boost": 2.0,
             "cond_noise_std": 0.0,
+            "cascade_dilate_kernel": 3,
+            "cascade_dilate_iters": 1,
+            "cascade_dilate_mode": "cross",
             "t_schedule": {
                 "name": "logitNormal",
                 "args": {
@@ -73,9 +78,7 @@
                     "betas": [0.9, 0.95]
                 }
             },
-            "ema_rate": [
-                0.999
-            ],
+            "ema_rate": [0.999],
             "grad_clip": {
                 "name": "AdaptiveGradClipper",
                 "args": {

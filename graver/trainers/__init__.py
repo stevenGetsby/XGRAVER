@@ -9,6 +9,12 @@ __attributes = {
     'SparseFlowMultiTokenCFGTrainer': 'flow_matching.feats_matching',
     'ImageConditionedSparseFlowMultiTokenCFGTrainer': 'flow_matching.feats_matching',
     'ImageConditionedDirectMaskTrainer': 'flow_matching.direct_mask',
+    'MaskRefineTrainer': 'flow_matching.mask_refine',
+    'ImageConditionedMaskRefineTrainer': 'flow_matching.mask_refine',
+    'UDF64FlowTrainer': 'flow_matching.udf64_flow',
+    'ImageConditionedUDF64FlowTrainer': 'flow_matching.udf64_flow',
+    'Patch2ToPatch4FlowTrainer': 'flow_matching.patch_mask_flow',
+    'ImageConditionedPatch2ToPatch4FlowTrainer': 'flow_matching.patch_mask_flow',
 }
 
 __submodules = []

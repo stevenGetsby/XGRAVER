@@ -114,9 +114,52 @@ class TextConditionedMixin:
     
     
 class ImageConditionedMixin:
-    def __init__(self, roots, *, image_size=518, **kwargs):
+    def __init__(self, roots, *, image_size=518, return_patch_coords=False, **kwargs):
         self.image_size = image_size
+        self.return_patch_coords = return_patch_coords
         super().__init__(roots, **kwargs)
+
+    @staticmethod
+    def _project_block_centers_to_crop(coords, frame, crop, image_size, original_size):
+        from ..dataset_toolkits.mesh2block import BLOCK_GRID
+
+        if coords.numel() == 0:
+            return torch.zeros(0, 2), torch.zeros(0, 1)
+
+        pts = (coords.float().numpy() + 0.5) / float(BLOCK_GRID) - 0.5
+        pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float32)], axis=1)
+
+        cam_to_world = np.asarray(frame['transform_matrix'], dtype=np.float32)
+        world_to_cam = np.linalg.inv(cam_to_world)
+        cam = pts_h @ world_to_cam.T
+
+        z = cam[:, 2]
+        depth = -z
+        f = 1.0 / max(np.tan(float(frame['camera_angle_x']) * 0.5), 1e-6)
+        x_ndc = (cam[:, 0] / np.maximum(depth, 1e-6)) * f
+        y_ndc = (cam[:, 1] / np.maximum(depth, 1e-6)) * f
+
+        width, height = original_size
+        u = (x_ndc + 1.0) * 0.5 * width
+        v = (1.0 - y_ndc) * 0.5 * height
+
+        crop_w = max(float(crop[2] - crop[0]), 1.0)
+        crop_h = max(float(crop[3] - crop[1]), 1.0)
+        u_crop = (u - float(crop[0])) / crop_w * image_size
+        v_crop = (v - float(crop[1])) / crop_h * image_size
+
+        denom = max(float(image_size - 1), 1.0)
+        x_grid = u_crop / denom * 2.0 - 1.0
+        y_grid = v_crop / denom * 2.0 - 1.0
+        xy = np.stack([x_grid, y_grid], axis=1).astype(np.float32)
+
+        valid = (
+            (depth > 1e-6)
+            & (xy[:, 0] >= -1.0) & (xy[:, 0] <= 1.0)
+            & (xy[:, 1] >= -1.0) & (xy[:, 1] <= 1.0)
+        ).astype(np.float32)[:, None]
+
+        return torch.from_numpy(xy), torch.from_numpy(valid)
     
     def filter_metadata(self, metadata):
         metadata, stats = super().filter_metadata(metadata)
@@ -139,6 +182,7 @@ class ImageConditionedMixin:
 
         image_path = os.path.join(image_root, metadata['file_path'])
         image = Image.open(image_path)
+        original_size = image.size
 
         alpha = np.array(image.getchannel(3))
         nz = np.array(alpha).nonzero()
@@ -164,6 +208,12 @@ class ImageConditionedMixin:
         alpha = torch.tensor(np.array(alpha)).float() / 255.0
         image = image * alpha.unsqueeze(0)
         pack['cond'] = image
+        if self.return_patch_coords and 'coords' in pack:
+            patch_xy, patch_valid = self._project_block_centers_to_crop(
+                pack['coords'], metadata, aug_bbox, self.image_size, original_size,
+            )
+            pack['patch_xy'] = patch_xy
+            pack['patch_valid'] = patch_valid
        
         return pack
 

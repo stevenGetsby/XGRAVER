@@ -95,12 +95,21 @@ def _load_model_from_weight(config_path: str, weight_path: str,
 
 
 def _adapt_submask(submask: torch.Tensor, src_res: int, dst_res: int) -> torch.Tensor:
-    """将 submask 从 src_res³ 上/下采样到 dst_res³ (nearest)."""
+    """将二值 submask 从 src_res³ 转到 dst_res³.
+
+    下采样用 max-pool 保留 surface support; 上采样用 nearest。
+    """
     if src_res == dst_res:
         return submask
     T = submask.shape[0]
     sub_3d = submask.reshape(T, 1, src_res, src_res, src_res)
-    out_3d = F.interpolate(sub_3d, size=dst_res, mode='nearest')
+    if src_res > dst_res:
+        if src_res % dst_res != 0:
+            raise ValueError(f'Cannot downsample submask {src_res} -> {dst_res}')
+        stride = src_res // dst_res
+        out_3d = F.max_pool3d(sub_3d, kernel_size=stride, stride=stride)
+    else:
+        out_3d = F.interpolate(sub_3d, size=dst_res, mode='nearest')
     return out_3d.reshape(T, -1)
 
 
@@ -375,8 +384,8 @@ def main():
                         default='configs/flow_matching/block_feats.json')
     parser.add_argument('--ckpt', type=str, default='latest')
     parser.add_argument('--ema_rate', type=float, default=0.999)
-    parser.add_argument('--mask_threshold', type=float, default=0.5,
-                        help='Threshold for mask binarization')
+    parser.add_argument('--mask_threshold', type=float, default=None,
+                        help='Threshold for mask binarization. Default: auto (0.58 for 64-dim DirectMask, 0.5 otherwise).')
     parser.add_argument('--coords_threshold', type=float, default=0.25,
                         help='Threshold for coords occupancy binarization (pred > threshold)')
 
@@ -413,6 +422,9 @@ def main():
     if has_mask and has_feats:
         dirs['mask_feats'] = os.path.join(args.output_dir, 'mask_feats')
         os.makedirs(dirs['mask_feats'], exist_ok=True)
+    if has_feats and not has_mask:
+        dirs['feats_only'] = os.path.join(args.output_dir, 'feats_only')
+        os.makedirs(dirs['feats_only'], exist_ok=True)
     if has_coords and has_mask and has_feats:
         dirs['full_pipeline'] = os.path.join(args.output_dir, 'full_pipeline')
         os.makedirs(dirs['full_pipeline'], exist_ok=True)
@@ -444,6 +456,12 @@ def main():
             feats_model = _load_model(
                 args.feats_config, args.feats_ckpt_dir, args.ckpt, ema, device=args.device,
             )
+
+    mask_threshold = args.mask_threshold
+    if has_mask and mask_threshold is None:
+        mask_res = round(mask_model.token_dim ** (1.0 / 3.0))
+        mask_threshold = 0.58 if mask_res == 4 else 0.5
+        print(f'[mask] auto threshold={mask_threshold:.2f} for token_dim={mask_model.token_dim}')
 
     encoder = None
     if has_coords or has_mask or has_feats:
@@ -495,10 +513,10 @@ def main():
 
         # ---- mask_only: GT coords → predict mask → metrics + normal render ----
         if has_mask:
-            print(f'\n  [mask] direct mask prediction (threshold={args.mask_threshold}) ...')
+            print(f'\n  [mask] direct mask prediction (threshold={mask_threshold}) ...')
             pred_mask = sample_mask(
                 mask_model, cond, sample['coords'],
-                device=args.device, threshold=args.mask_threshold,
+                device=args.device, threshold=mask_threshold,
             )
             pred_mask_res = round(mask_model.token_dim ** (1.0 / 3.0))
 
@@ -558,6 +576,31 @@ def main():
                 os.path.join(dirs['mask_feats'], f'{seq_num}_normal.jpg'),
             )
 
+        # ---- feats_only: GT coords + GT submask → predict feats → mesh ----
+        if has_feats and not has_mask:
+            feats_submask_res = feats_model.submask_resolution
+            if feats_submask_res > 0 and gt_submask_res != feats_submask_res:
+                submask_for_feats = _adapt_submask(
+                    gt_submask, gt_submask_res, feats_submask_res,
+                )
+            else:
+                submask_for_feats = gt_submask
+
+            print(f'\n  [feats_only] stage 3: sampling feats (GT coords + GT submask) ...')
+            pred_feats = sample_feats(
+                feats_model, cond, sample['coords'], submask_for_feats,
+                noise_scale=args.noise_scale_feats,
+                cfg_strength=args.cfg_strength,
+                cfg_interval=(args.cfg_interval_min, args.cfg_interval_max),
+                steps=args.steps, device=args.device,
+            )
+            torch.cuda.empty_cache()
+            _save_mesh_and_normal(
+                coords_np, pred_feats.cpu().numpy().astype(np.float32),
+                os.path.join(dirs['feats_only'], f'{seq_num}.ply'),
+                os.path.join(dirs['feats_only'], f'{seq_num}_normal.jpg'),
+            )
+
         # ---- full_pipeline: predict coords → predict mask → predict feats → mesh ----
         if has_coords and has_mask and has_feats:
             print(f'\n  [full_pipeline] stage 1: sampling coords (threshold={args.coords_threshold}) ...')
@@ -574,10 +617,10 @@ def main():
             if pred_coords.shape[0] < 5:
                 print(f'    ⚠ too few blocks, skipping full pipeline')
             else:
-                print(f'  [full_pipeline] stage 2: direct mask prediction (threshold={args.mask_threshold}) ...')
+                print(f'  [full_pipeline] stage 2: direct mask prediction (threshold={mask_threshold}) ...')
                 pred_mask = sample_mask(
                     mask_model, cond, pred_coords,
-                    device=args.device, threshold=args.mask_threshold,
+                    device=args.device, threshold=mask_threshold,
                 )
 
                 pred_mask_res = round(mask_model.token_dim ** (1.0 / 3.0))

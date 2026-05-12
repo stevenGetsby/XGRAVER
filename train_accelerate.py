@@ -379,11 +379,34 @@ class AccelerateTrainerMixin:
             model_ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
             # Unwrap to load
             unwrapped_model = self.accelerator.unwrap_model(model)
+            model_state = unwrapped_model.state_dict()
+            if (
+                'predict.weight' in model_ckpt
+                and 'fine_predict.weight' in model_state
+                and model_ckpt['predict.weight'].shape == model_state['fine_predict.weight'].shape
+            ):
+                model_ckpt.setdefault('fine_predict.weight', model_ckpt['predict.weight'])
+            if (
+                'predict.bias' in model_ckpt
+                and 'fine_predict.bias' in model_state
+                and model_ckpt['predict.bias'].shape == model_state['fine_predict.bias'].shape
+            ):
+                model_ckpt.setdefault('fine_predict.bias', model_ckpt['predict.bias'])
             _missing, _unexpected = unwrapped_model.load_state_dict(model_ckpt, strict=False)
             if _missing:
                 logger.warning(f"  [{name}] missing keys (will use init): {_missing}")
             if _unexpected:
                 logger.warning(f"  [{name}] unexpected keys (ignored): {_unexpected}")
+
+        # EMA was initialized before checkpoint loading. Reset it to the loaded
+        # trainable weights so finetune EMA checkpoints do not start from random init.
+        if self.is_master:
+            unwrapped_models = {name: self.accelerator.unwrap_model(model) for name, model in self.models.items()}
+            master_params_raw = sum(
+                [[p for p in model.parameters() if p.requires_grad] for model in unwrapped_models.values()]
+            , [])
+            self._ema_source_params = master_params_raw
+            self.ema_params = [[p.detach().clone() for p in master_params_raw] for _ in self.ema_rate]
 
         # Load Misc
         misc_path = os.path.join(load_dir, 'ckpts', f'misc_step{step:07d}.pt')

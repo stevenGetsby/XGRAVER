@@ -7,25 +7,58 @@ Each block has 8³=512 sub-voxels, 1 = surface, 0 = empty.
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from .components import StandardDatasetBase, ImageConditionedMixin
 from ..modules.sparse.basic import SparseTensor
 from ..utils.data_utils import load_balanced_group_indices
 from ..dataset_toolkits.mesh2block import SUBMASK_DIM, BLOCK_FOLDER, COL_PREFIX
 
+PRED_MASK_CACHE = 'pred_mask_cache'
+
 
 class BlockMask(StandardDatasetBase):
 
     def __init__(self, roots, *, max_block_num=15000, min_block_num=0,
-                 min_aesthetic_score=5.0, max_samples=0):
+                 min_aesthetic_score=5.0, max_samples=0,
+                 require_pred_mask: bool = False,
+                 mask_resolution: int = 8,
+                 return_full_submask: bool = False):
+        """
+        require_pred_mask: if True, only keep npz that contains 'pred_mask'
+                           and also return it as 'pred_submask' from get_instance.
+                           Used by mask-refiner training.
+        mask_resolution: output mask spatial resolution per block axis.
+                         8 → 512-dim (default), 4 → 64-dim (max-pooled from 512).
+        """
         self.max_block_num = max_block_num
         self.min_block_num = min_block_num
         self.min_aesthetic_score = min_aesthetic_score
+        self.mask_resolution = mask_resolution
+        self.return_full_submask = return_full_submask
         self.max_samples = max_samples
+        self.require_pred_mask = require_pred_mask
         self.value_range = (0, 1)
         super().__init__(roots)
+
+        def _has_readable_npz(root, instance):
+            npz_path = os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')
+            if not (os.path.exists(npz_path) and os.access(npz_path, os.R_OK)):
+                return False
+            if self.require_pred_mask:
+                # pred_mask can live in npz OR in pred_mask_cache/{instance}.npy
+                cache_path = os.path.join(root, PRED_MASK_CACHE, f'{instance}.npy')
+                if os.path.exists(cache_path):
+                    return True
+                try:
+                    with np.load(npz_path) as data:
+                        return 'pred_mask' in data.files
+                except Exception:
+                    return False
+            return True
+
         self.filter_existing_instances(
-            lambda root, instance: os.path.exists(os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')),
-            stat_name='npz exists',
+            _has_readable_npz,
+            stat_name='pred_mask readable' if require_pred_mask else 'npz readable',
         )
 
         if self.max_samples > 0 and len(self.instances) > self.max_samples:
@@ -56,7 +89,35 @@ class BlockMask(StandardDatasetBase):
                 submask = torch.from_numpy(data['submask'].astype(np.float32))
             else:
                 submask = torch.ones(coords.shape[0], SUBMASK_DIM)
-        return {'coords': coords, 'submask': submask}
+            full_submask = submask.clone()
+
+            # Pool to coarser resolution if requested
+            if self.mask_resolution != 8:
+                T = submask.shape[0]
+                vol = submask.reshape(T, 1, 8, 8, 8)
+                stride = 8 // self.mask_resolution
+                submask = F.max_pool3d(vol, kernel_size=stride, stride=stride)
+                submask = submask.reshape(T, -1)
+
+            out = {'coords': coords, 'submask': submask}
+            if self.return_full_submask:
+                out['full_submask'] = full_submask
+        if self.require_pred_mask:
+            npz_path = os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')
+            cache_path = os.path.join(root, PRED_MASK_CACHE, f'{instance}.npy')
+            if os.path.exists(cache_path):
+                out['pred_submask'] = torch.from_numpy(
+                    np.load(cache_path).astype(np.float32)
+                )
+            else:
+                with np.load(npz_path) as data:
+                    if 'pred_mask' in data.files:
+                        out['pred_submask'] = torch.from_numpy(
+                            data['pred_mask'].astype(np.float32)
+                        )
+                    else:
+                        out['pred_submask'] = submask.clone()
+        return out
 
     @staticmethod
     def collate_fn(batch, split_size=None):
@@ -70,7 +131,8 @@ class BlockMask(StandardDatasetBase):
         packs = []
         for group in group_idx:
             sub = [batch[i] for i in group]
-            coords_list, mask_list, layout = [], [], []
+            coords_list, mask_list, pred_list, full_mask_list = [], [], [], []
+            patch_xy_list, patch_valid_list, layout = [], [], []
             start = 0
             for i, b in enumerate(sub):
                 n = b['coords'].shape[0]
@@ -78,6 +140,14 @@ class BlockMask(StandardDatasetBase):
                     torch.full((n, 1), i, dtype=torch.int32), b['coords'],
                 ], dim=-1))
                 mask_list.append(b['submask'])
+                if 'pred_submask' in b:
+                    pred_list.append(b['pred_submask'])
+                if 'full_submask' in b:
+                    full_mask_list.append(b['full_submask'])
+                if 'patch_xy' in b:
+                    patch_xy_list.append(b['patch_xy'])
+                if 'patch_valid' in b:
+                    patch_valid_list.append(b['patch_valid'])
                 layout.append(slice(start, start + n))
                 start += n
 
@@ -91,9 +161,20 @@ class BlockMask(StandardDatasetBase):
                     layout=layout,
                 ),
             }
+            if pred_list:
+                pack['pred_submask'] = torch.cat(pred_list, 0)
+            if full_mask_list:
+                pack['full_submask'] = torch.cat(full_mask_list, 0)
+            if patch_xy_list:
+                pack['patch_xy'] = torch.cat(patch_xy_list, 0)
+            if patch_valid_list:
+                pack['patch_valid'] = torch.cat(patch_valid_list, 0)
 
             # Forward extra keys (cond, etc.)
-            exclude = {'coords', 'submask'}
+            exclude = {
+                'coords', 'submask', 'pred_submask', 'full_submask',
+                'patch_xy', 'patch_valid',
+            }
             for k in sub[0]:
                 if k in exclude:
                     continue

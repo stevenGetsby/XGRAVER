@@ -28,6 +28,7 @@ class BlockFeats(StandardDatasetBase):
         max_samples: int = 0,
         pred_mask_dir: str = '',
         require_pred_mask: bool = False,
+        instances_file: str = '',
     ):
         self.max_block_num = max_block_num
         self.min_block_num = min_block_num
@@ -35,8 +36,13 @@ class BlockFeats(StandardDatasetBase):
         self.max_samples = max_samples
         self.pred_mask_dir = pred_mask_dir
         self.require_pred_mask = require_pred_mask
+        self.instances_file = instances_file
 
         super().__init__(roots)
+
+        if self.instances_file:
+            self._filter_instances_file(self.instances_file)
+
         self.filter_existing_instances(
             lambda root, instance: os.path.exists(os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')),
             stat_name='npz exists',
@@ -62,6 +68,29 @@ class BlockFeats(StandardDatasetBase):
         ]
         if self.max_samples > 0:
             print(f'  [Dataset] max_samples={self.max_samples}, actual={len(self.instances)}')
+
+    def _filter_instances_file(self, instances_file):
+        wanted = set()
+        with open(instances_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    wanted.add((parts[0], parts[1]))
+                else:
+                    wanted.add(parts[0])
+
+        keep_indices = []
+        for i, (root, instance) in enumerate(self.instances):
+            if (root, instance) in wanted or instance in wanted:
+                keep_indices.append(i)
+
+        before = len(self.instances)
+        self.instances = [self.instances[i] for i in keep_indices]
+        self.metadata = self.metadata.iloc[keep_indices].reset_index(drop=True)
+        print(f'  [BlockFeats] instances_file={instances_file}, filtered {before} -> {len(self.instances)}')
 
     def _has_pred_mask(self, root, instance):
         npz_path = os.path.join(root, BLOCK_FOLDER, f'{instance}.npz')
@@ -451,7 +480,8 @@ class BlockFeats(StandardDatasetBase):
             if pred_submask_list:
                 pack['pred_submask'] = torch.cat(pred_submask_list, dim=0)
 
-            exclude_keys = {'coords', 'fine_feats', 'submask', 'pred_submask'}
+            exclude_keys = {'coords', 'fine_feats', 'submask',
+                            'pred_submask'}
             other_keys = [k for k in sub_batch[0].keys() if k not in exclude_keys]
 
             for k in other_keys:

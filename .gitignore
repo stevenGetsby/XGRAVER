@@ -25,5 +25,7 @@ venv/
 # ================= 其他可能的中间产物 =================
 tests/temp/
 output/
+exports/
+eval_modelscope_sket_2samples_feats_only_preview/
 *_summary.txt
 log.txt

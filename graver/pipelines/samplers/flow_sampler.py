@@ -8,6 +8,10 @@ from .classifier_free_guidance_mixin import ClassifierFreeGuidanceSamplerMixin
 from .guidance_interval_mixin import GuidanceIntervalSamplerMixin
 
 
+# MC_THRESHOLD 是从 mesh2block 导入的常量, 这里本地定义避免循环依赖
+_MC_SURFACE_THRESHOLD = 0.4   # = 2 * MC_THRESHOLD (0.2), 用于判定"接近表面"
+
+
 def _apply_voxel_mask(z, voxel_mask, bg_fill: float = 1.0):
     """mask=0 的位置强制 = bg_fill (远场确定值, 默认 1.0)"""
     if voxel_mask is None:
@@ -18,6 +22,19 @@ def _apply_voxel_mask(z, voxel_mask, bg_fill: float = 1.0):
         return z.replace(masked_feats)
     else:
         return z * voxel_mask + (1.0 - voxel_mask) * bg_fill
+
+
+def _expand_mask_by_prediction(voxel_mask, pred_x, surface_thr: float = _MC_SURFACE_THRESHOLD):
+    """Self-correcting: 如果 model 在 mask=0 区域预测出表面 (UDF < thr), 将该区域加入 mask。
+
+    只扩展不收缩 — 对原始 mask=1 区域无影响。
+    """
+    if voxel_mask is None:
+        return None
+    feats = pred_x.feats if hasattr(pred_x, 'feats') else pred_x
+    # 按 voxel 判断: 任一 voxel UDF < threshold → 认为有表面
+    surface_detected = (feats < surface_thr).float()
+    return torch.maximum(voxel_mask, surface_detected)
 
 
 class FlowSampler(Sampler):
@@ -105,6 +122,8 @@ class FlowSampler(Sampler):
         # 提取 voxel_mask / bg_fill: pop 避免传入 model forward
         voxel_mask = kwargs.pop('voxel_mask', None)
         bg_fill = kwargs.pop('bg_fill', 1.0)
+        kwargs.pop('fill_until', None)  # 兼容旧调用
+        kwargs.pop('mask_expand_after', None)  # 兼容旧调用
 
         z_t = noise
         t_seq = np.linspace(0.0, 1.0, steps + 1)

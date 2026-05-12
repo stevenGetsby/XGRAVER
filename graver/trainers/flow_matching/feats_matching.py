@@ -370,16 +370,17 @@ class SparseFlowMultiTokenTrainer(FlowMatchingTrainer):
         v = self.voxel
 
         with torch.no_grad():
-            # Build dilated voxel mask from pred_submask (fallback: GT submask, fallback: all-ones)
+            # Pick the sub-mask source: pred_submask (fallback to GT)
             if pred_submask is not None:
                 pred_sub = pred_submask.to(device)
             elif submask is not None:
                 pred_sub = submask.to(device)
             else:
                 pred_sub = torch.ones(T, SUBMASK_RES ** 3, device=device)
+
             voxel_mask = self._build_voxel_mask(pred_sub)
 
-            # GT clip (optional) + hard-fill on mask=0
+            # GT clip (optional) + linear blend on mask<1 (hard-fill when mask=0)
             bg_fill = self._gt_clip_max if self._gt_clip_max is not None else 1.0
             if self._gt_clip_max is not None:
                 gt = x.feats.clamp(max=self._gt_clip_max)

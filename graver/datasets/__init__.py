@@ -9,6 +9,8 @@ __attributes = {
     'TextConditionedBlockFeats': 'block_feats',
     'ImageConditionedBlockFeats': 'block_feats',
     'PrecomputedImageConditionedBlockFeats': 'block_feats',
+    'BlockUDF64': 'block_udf64',
+    'ImageConditionedBlockUDF64': 'block_udf64',
 }
 
 __submodules = []

@@ -4,6 +4,7 @@ __attributes = {
     "DenseFlowModel": "dense_flow",
     "SparseFlowModel": "sparse_flow",
     "DirectMaskModel": "direct_mask",
+    "MaskRefineModel": "mask_refine",
 }
 
 __submodules = []
